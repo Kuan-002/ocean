@@ -1,5 +1,25 @@
-#*.pyc
-#.env*
-#out/*
-#*.sh
-#*.log
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Tests / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local env (root); template envs under scripts/envs/ stay tracked
+/.env
+
+# Checkpoints, runs, datasets (large)
+out/
+
+# Logs / OS
+*.log
+.DS_Store
