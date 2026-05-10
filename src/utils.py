@@ -44,6 +44,21 @@ def load_latest_checkpoint(checkpoint_dir, top=0):
     
     return checkpoint
 
+def resolve_checkpoint_path(path: str, top: int = 0) -> str:
+    """
+    If `path` is a directory, pick a `.pt` file inside (newest ctime when top=0;
+    same semantics as load_latest_checkpoint for top>0).
+    If `path` is a file, return it. Otherwise raise.
+    """
+    path = os.path.expanduser(path)
+    if os.path.isdir(path):
+        return load_latest_checkpoint(path, top=top)
+    if os.path.isfile(path):
+        return path
+    raise FileNotFoundError(
+        f"Checkpoint not found (need a .pt file or a directory of .pt): {path}"
+    )
+
 def reconstruct_autoencoder(checkpoint, config):
     """Reconstruct the model from a checkpoint."""
     model = SlotAutoencoder(config)

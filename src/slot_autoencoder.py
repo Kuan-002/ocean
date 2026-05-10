@@ -57,17 +57,29 @@ class SlotAutoencoder(nn.Module):
         if config.use_gpu:
             self.cuda()
 
+    def forward_slots_only(self, x: Tensor) -> Tuple[Tensor, Tensor]:
+        """Encode images to slot vectors without running the decoder (plan: reuse for explanation)."""
+        x = self.encoder(x)
+        x = self.mlp(x.reshape(*x.shape[:2], -1).permute(0, 2, 1))
+        slots, attn = self.slot_attention(x)
+        return slots, attn
+
     def forward(self, x: Tensor):
         # b: batch_size, c: channels, h: height, w: width, d: out_channels
         b, c, h, w = x.shape
         # (b, d, h, w)
-        x = self.encoder(x)
+        enc = self.encoder(x)
         # (b, h*w, d)
-        x = self.mlp(x.reshape(*x.shape[:2], -1).permute(0, 2, 1))  # flatten img
+        enc = self.mlp(enc.reshape(*enc.shape[:2], -1).permute(0, 2, 1))  # flatten img
 
         # (b, num_slots, slot_dim)
-        slots, attn = self.slot_attention(x)
+        slots, attn = self.slot_attention(enc)
 
+        return self._decode_slots_to_recon(b, c, h, w, slots, attn)
+
+    def _decode_slots_to_recon(
+        self, b: int, c: int, h: int, w: int, slots: Tensor, attn: Tensor
+    ):
         # (b*num_slots, slot_dim, init_h, init_w)
         x = slots.view(-1, slots.shape[-1])[:, :, None, None]
         x = x.repeat(1, 1, *self.slot_grid)

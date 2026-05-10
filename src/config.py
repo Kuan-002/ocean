@@ -41,6 +41,7 @@ class Config:
         self._load_consensus_game_config()
         self._load_rnn_config()
         self._load_classifier_config()
+        self._load_deepsets_pipeline_config()
         self._load_trainer_config()
         self._load_player_config()
         self._load_evaluator_config()
@@ -96,6 +97,52 @@ class Config:
 
     def _load_classifier_config(self):
         self.classifier_hidden = int(os.getenv("CLASSIFIER_HIDDEN", 256))
+
+    def _load_deepsets_pipeline_config(self):
+        """DeepSets classification + subset evaluator (plan §4.1–4.2)."""
+        self.ds_aggregate = os.getenv("DS_AGGREGATE", "sum").lower()
+        if self.ds_aggregate not in ("sum", "mean"):
+            raise ValueError("DS_AGGREGATE must be 'sum' or 'mean'")
+        self.ds_phi_hidden = int(os.getenv("DS_PHI_HIDDEN", str(self.classifier_hidden)))
+        self.ds_rho_hidden = int(os.getenv("DS_RHO_HIDDEN", str(self.ds_phi_hidden)))
+        self.ds_cls_lr = float(os.getenv("DS_CLS_LR", "1e-3"))
+        self.ds_cls_epochs = int(os.getenv("DS_CLS_EPOCHS", os.getenv("EPOCHS", "500")))
+        self.ds_cls_weight_decay = float(os.getenv("DS_CLS_WEIGHT_DECAY", "1e-5"))
+        self.ds_subset_lr = float(os.getenv("DS_SUBSET_LR", "1e-3"))
+        self.ds_subset_epochs = int(os.getenv("DS_SUBSET_EPOCHS", os.getenv("EPOCHS", "500")))
+        self.ds_subset_weight_decay = float(os.getenv("DS_SUBSET_WEIGHT_DECAY", "1e-5"))
+        self.ds_distill_temperature = float(os.getenv("DS_DISTILL_TEMPERATURE", "1.0"))
+        self.ds_num_classes = len(self.labels)
+        self.ds_tau = float(os.getenv("DS_TAU", "0.6"))
+        self.ds_epsilon = float(os.getenv("DS_EPSILON", "0.05"))
+
+        # Sequential RNN selector (inductive GRU + GRPO; §4.2 not used)
+        self.rnn_sel_hidden_dim = int(os.getenv("RNN_SEL_HIDDEN_DIM", str(self.ds_phi_hidden)))
+        self.rnn_sel_embed_dim = int(os.getenv("RNN_SEL_EMBED_DIM", str(self.ds_phi_hidden)))
+        self.rnn_sel_lr = float(os.getenv("RNN_SEL_LR", "1e-4"))
+        self.rnn_sel_weight_decay = float(os.getenv("RNN_SEL_WEIGHT_DECAY", "1e-5"))
+        self.rnn_sel_epochs = int(os.getenv("RNN_SEL_EPOCHS", os.getenv("EPOCHS", "500")))
+        self.rnn_sel_imitation_epochs = int(os.getenv("RNN_SEL_IMITATION_EPOCHS", "10"))
+        self.rnn_sel_lambda_len = float(os.getenv("RNN_SEL_LAMBDA_LEN", "0.05"))
+        self.rnn_sel_success_reward = float(os.getenv("RNN_SEL_SUCCESS_REWARD", "0.5"))
+        self.rnn_sel_fail_penalty = float(os.getenv("RNN_SEL_FAIL_PENALTY", "0.2"))
+        self.rnn_sel_max_steps = int(os.getenv("RNN_SEL_MAX_STEPS", str(self.num_slots)))
+        self.rnn_sel_eval_samples = int(os.getenv("RNN_SEL_EVAL_SAMPLES", "512"))
+        self.rnn_sel_grpo_group_size = int(os.getenv("RNN_SEL_GRPO_GROUP_SIZE", "4"))
+        self.rnn_sel_grpo_beta = float(os.getenv("RNN_SEL_GRPO_BETA", "0.1"))
+        self.rnn_sel_grpo_eps = float(os.getenv("RNN_SEL_GRPO_EPS", "1e-8"))
+        self.rnn_sel_alpha_class = float(os.getenv("RNN_SEL_ALPHA_CLASS", "1.0"))
+        self.rnn_sel_max_grad_norm = float(os.getenv("RNN_SEL_MAX_GRAD_NORM", "1.0"))
+        self.rnn_sel_grpo_adv_clip = float(os.getenv("RNN_SEL_GRPO_ADV_CLIP", "10.0"))
+        self.rnn_sel_eval_require_tau_to_stop = (
+            os.getenv("RNN_SEL_EVAL_REQUIRE_TAU_TO_STOP", "False").lower() == "true"
+        )
+        self.rnn_sel_imitation_alpha_class = float(
+            os.getenv("RNN_SEL_IMITATION_ALPHA_CLASS", "2.0")
+        )
+        self.rnn_sel_eval_disable_conf_early_exit = (
+            os.getenv("RNN_SEL_EVAL_DISABLE_CONF_EARLY_EXIT", "False").lower() == "true"
+        )
 
     def _load_trainer_config(self):
         self.epochs = int(os.getenv("EPOCHS", 500))
