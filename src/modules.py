@@ -79,7 +79,7 @@ class RNNClassifier(nn.Module):
     """ A RNN and Classifier pair for tracking a hidden state and making predictions. """
     def __init__(self, modulator_input_size: int, rnn_input_size: int, hidden_state_size: int, hidden_layer_size: int, output_size: int, use_gpu: bool):
         super(RNNClassifier, self).__init__()
-        self.rnn = StateRNN(modulator_input_size, rnn_input_size, hidden_state_size, use_gpu, rnn_type='RNN')
+        self.rnn = StateRNN(modulator_input_size, rnn_input_size, hidden_state_size, use_gpu, rnn_type='GRU')
         self.classifier = Classifier(hidden_state_size, hidden_layer_size, output_size, use_gpu)
         self.hidden_state = None
         

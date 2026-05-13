@@ -108,6 +108,66 @@ class DeepSetsSubsetEvaluator(nn.Module):
         return F.softmax(logits, dim=-1)
 
 
+class EnhancedDeepSetsClassifier(nn.Module):
+    """
+    Improved permutation-invariant classifier for CLEVR-Hans7.
+
+    Over DeepSetsClassifier:
+    - phi: 3-layer MLP with LayerNorm + GELU — richer per-slot representations
+    - Aggregation: concat(sum_pool, max_pool) — sum captures additive evidence,
+      max captures the single most informative slot (key for rule-based concepts)
+    - rho: 3-layer MLP with Dropout — regularised multi-object combination
+    """
+
+    def __init__(
+        self,
+        slot_dim: int,
+        phi_hidden: int,
+        rho_hidden: int,
+        num_classes: int,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.phi = nn.Sequential(
+            nn.Linear(slot_dim, phi_hidden),
+            nn.LayerNorm(phi_hidden),
+            nn.GELU(),
+            nn.Linear(phi_hidden, phi_hidden),
+            nn.LayerNorm(phi_hidden),
+            nn.GELU(),
+            nn.Linear(phi_hidden, phi_hidden),
+            nn.LayerNorm(phi_hidden),
+        )
+        # sum_pool + max_pool → 2 * phi_hidden
+        self.rho = nn.Sequential(
+            nn.Linear(phi_hidden * 2, rho_hidden),
+            nn.LayerNorm(rho_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(rho_hidden, rho_hidden // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(rho_hidden // 2, num_classes),
+        )
+
+    def forward(self, slots: Tensor, mask: Tensor | None = None) -> Tensor:
+        """slots: [B, K, D]  mask: [B, K] (1=include, 0=drop)"""
+        B, K, _ = slots.shape
+        if mask is None:
+            mask = torch.ones(B, K, device=slots.device, dtype=slots.dtype)
+        h = self.phi(slots)                             # [B, K, phi_hidden]
+        w = mask.unsqueeze(-1)                          # [B, K, 1]
+        sum_agg = (h * w).sum(dim=1)                    # [B, phi_hidden]
+        h_masked = h + (1.0 - w) * (-1e9)
+        max_agg = h_masked.max(dim=1).values            # [B, phi_hidden]
+        agg = torch.cat([sum_agg, max_agg], dim=-1)     # [B, 2*phi_hidden]
+        return self.rho(agg)
+
+    @torch.inference_mode()
+    def predict_proba(self, slots: Tensor, mask: Tensor | None = None) -> Tensor:
+        return F.softmax(self.forward(slots, mask), dim=-1)
+
+
 def kl_distill_loss(
     student_logits: Tensor, teacher_probs: Tensor, temperature: float
 ) -> Tensor:

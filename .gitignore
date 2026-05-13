@@ -9,6 +9,10 @@ __pycache__/
 dist/
 build/
 out/
+bin/
+lib/
+lib64/
+examples/
 scripts/datasets
 # Tests / coverage
 .pytest_cache/

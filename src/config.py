@@ -113,6 +113,8 @@ class Config:
         self.ds_subset_weight_decay = float(os.getenv("DS_SUBSET_WEIGHT_DECAY", "1e-5"))
         self.ds_distill_temperature = float(os.getenv("DS_DISTILL_TEMPERATURE", "1.0"))
         self.ds_num_classes = len(self.labels)
+        self.ds_dropout = float(os.getenv("DS_DROPOUT", "0.1"))
+        self.ds_label_smoothing = float(os.getenv("DS_LABEL_SMOOTHING", "0.0"))
         self.ds_tau = float(os.getenv("DS_TAU", "0.6"))
         self.ds_epsilon = float(os.getenv("DS_EPSILON", "0.05"))
 
