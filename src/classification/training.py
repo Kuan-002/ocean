@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -7,11 +9,43 @@ from src.classification.subset_sampling import stratified_subset_masks
 from src.slot_autoencoder import SlotAutoencoder
 
 
+def make_per_image_slot_init_noise(
+    images: torch.Tensor,
+    num_slots: int,
+    slot_dim: int,
+    base_seed: int,
+) -> torch.Tensor:
+    """Reproducible SlotAttention init noise: same image tensor -> same noise (per-row seeds)."""
+    b, _, _, _ = images.shape
+    device = images.device
+    dtype = images.dtype
+    noise = torch.empty(b, num_slots, slot_dim, device=device, dtype=dtype)
+    flat = images.detach().reshape(b, -1)
+    for i in range(b):
+        g = torch.Generator(device=device)
+        s = int(flat[i].sum().item() * 1e6) % (2**31 - 2)
+        g.manual_seed(int((base_seed + s + i * 100_003) % (2**31 - 1)))
+        noise[i] = torch.randn(num_slots, slot_dim, generator=g, device=device, dtype=dtype)
+    return noise
+
+
 @torch.no_grad()
-def batch_slots(sa: SlotAutoencoder, images: torch.Tensor, device: torch.device) -> torch.Tensor:
+def batch_slots(
+    sa: SlotAutoencoder,
+    images: torch.Tensor,
+    device: torch.device,
+    *,
+    sa_deterministic: bool = False,
+    sa_noise_seed: int = 0,
+    num_slots: int = 11,
+    slot_dim: int = 64,
+) -> torch.Tensor:
     sa.eval()
     x = images.to(device)
-    slots, _ = sa.forward_slots_only(x)
+    slot_noise = None
+    if sa_deterministic:
+        slot_noise = make_per_image_slot_init_noise(x, num_slots, slot_dim, sa_noise_seed)
+    slots, _ = sa.forward_slots_only(x, slot_init_noise=slot_noise)
     return slots
 
 

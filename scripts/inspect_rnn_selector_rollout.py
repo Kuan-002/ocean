@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Print greedy action sequences (slot indices + STOP) for a few val images."""
+"""Print greedy action sequences for a few val images."""
 
 from __future__ import annotations
 
@@ -25,6 +25,8 @@ def rollout_end_reason(r: int, out: dict) -> str:
         return "STOP_argmax"
     if bool(out["timed_out"][r].item()):
         return "max_steps_no_done"
+    if "t_star" in out:
+        return "force_full_or_conf_early_exit"
     return "eval_early_exit_p>=tau"
 
 
@@ -50,6 +52,9 @@ def build_sel_cfg(config: Config, require_tau_to_stop: bool, no_conf_early_exit:
         epsilon=config.ds_epsilon,
         max_steps=config.rnn_sel_max_steps,
         lambda_len=config.rnn_sel_lambda_len,
+        force_full_rollout=config.rnn_sel_force_full_rollout,
+        global_init=config.rnn_sel_global_init,
+        area_weight=config.rnn_sel_area_weight,
         success_reward=config.rnn_sel_success_reward,
         fail_penalty=config.rnn_sel_fail_penalty,
         grpo_group_size=config.rnn_sel_grpo_group_size,
@@ -98,12 +103,18 @@ def main() -> None:
         hidden_dim=config.rnn_sel_hidden_dim,
         num_slots=config.num_slots,
         num_classes=config.ds_num_classes,
+        use_stop_action=not config.rnn_sel_force_full_rollout,
     ).to(device)
     ckpt = torch.load(
         resolve_checkpoint_path(args.selector_checkpoint), map_location=device, weights_only=True
     )
     policy.load_state_dict(ckpt["state_dict"])
     policy.eval()
+
+    slot_kw: dict = {"num_slots": config.num_slots, "slot_dim": config.slot_dim}
+    if config.rnn_sel_sa_deterministic_slots:
+        slot_kw["sa_deterministic"] = True
+        slot_kw["sa_noise_seed"] = config.rnn_sel_sa_noise_seed
 
     sel_cfg = build_sel_cfg(config, args.require_tau_to_stop, args.no_conf_early_exit)
     ref = policy
@@ -112,7 +123,7 @@ def main() -> None:
             break
         images = batch[0].to(device)
         gt = batch[2].to(device)
-        slots = batch_slots(sa, images, device)
+        slots = batch_slots(sa, images, device, **slot_kw)
         trace: list[torch.Tensor] = []
         out = run_grpo_rollout(policy, ref, slots, gt, sel_cfg, train=False, action_trace=trace)
         n_sel = out["selected_mask"].float().sum(-1)

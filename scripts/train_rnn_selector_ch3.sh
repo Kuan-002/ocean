@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# RNN slot selector: imitation (action + class_head vs y_hat) + GRPO. CLEVR-Hans3 / SA 64 / 11 slots.
-# Env: scripts/envs/.envA_ch3_rnn (see RNN_SEL_IMITATION_ALPHA_CLASS, RNN_SEL_EVAL_DISABLE_CONF_EARLY_EXIT).
+# RNN slot selector: full-order imitation (action + class_head vs y_hat) + GRPO.
+# CLEVR-Hans3 / SA 64 / 11 slots.
+# Env: scripts/envs/.envA_ch3_rnn (see RNN_SEL_FORCE_FULL_ROLLOUT, RNN_SEL_AREA_WEIGHT).
 # Prerequisites: SA + DeepSets checkpoints; DATASET_PATH in env.
 #
 # Eval best checkpoint (after training):
 #   python scripts/eval_rnn_selector.py \
 #     --env_path scripts/envs/.envA_ch3_rnn \
-#     --sa_checkpoint out/sa_ch3_64_1/checkpoints/sa/999_ckpt.pt \
+#     --sa_checkpoint out/sa.pt \
 #     --selector_checkpoint <OUT_DIR>/rnn_selector_best.pt \
 #     --split val
 #
@@ -17,8 +18,8 @@ cd "$REPO"
 ENV_FILE="${ENV_FILE:-scripts/envs/.envA_ch3_rnn}"
 PYTHON="${PYTHON:-python3}"
 OUT="${OUT:-$REPO/out/rnn_selector_ch3_$(date +%Y%m%d_%H%M%S)}"
-SA_CKPT="${SA_CKPT:-out/sa_ch3_64_1/checkpoints/sa/999_ckpt.pt}"
-CLS_CKPT="${CLS_CKPT:-out/deepsets_classification_1/deepsets_classifier_best.pt}"
+SA_CKPT="${SA_CKPT:-out/sa.pt}"
+CLS_CKPT="${CLS_CKPT:-out/deepsets_classifier_best.pt}"
 
 exec "$PYTHON" scripts/run_train_rnn_selector.py \
   --env_path "$ENV_FILE" \

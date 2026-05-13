@@ -34,7 +34,12 @@ class SlotAttention(nn.Module):
             nn.Linear(hidden_dim, self.slot_dim),
         )
 
-    def forward(self, x: Tensor, num_slots: Optional[int] = None):
+    def forward(
+        self,
+        x: Tensor,
+        num_slots: Optional[int] = None,
+        slot_init_noise: Optional[Tensor] = None,
+    ):
         # b: batch_size, n: num_inputs, c: input_dim, K: num_slots, d: slot_dim
         b = x.shape[0]
         # (b, n, c)
@@ -44,9 +49,15 @@ class SlotAttention(nn.Module):
         v = torch.einsum("bnc,cd->bnd", x, self.W_v)
         # (b, k, d)
         K = num_slots if num_slots is not None else self.num_slots
-        slots = self.loc + self.logscale.exp() * torch.randn(
-            b, K, self.slot_dim, device=x.device
-        )
+        if slot_init_noise is not None:
+            if slot_init_noise.shape != (b, K, self.slot_dim):
+                raise ValueError(
+                    f"slot_init_noise expected {(b, K, self.slot_dim)}, got {tuple(slot_init_noise.shape)}"
+                )
+            noise = slot_init_noise.to(device=x.device, dtype=x.dtype)
+        else:
+            noise = torch.randn(b, K, self.slot_dim, device=x.device, dtype=x.dtype)
+        slots = self.loc + self.logscale.exp() * noise
 
         for _ in range(self.routing_iters):
             slots_prev = slots

@@ -8,14 +8,15 @@ __pycache__/
 .eggs/
 dist/
 build/
-
+out/
+scripts/datasets
 # Tests / coverage
 .pytest_cache/
 .coverage
 htmlcov/
 
 # Local env (root); template envs under scripts/envs/ stay tracked
-/.env
+#/.env
 
 # Checkpoints, runs, datasets (large)
 out/

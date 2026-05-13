@@ -124,6 +124,13 @@ class Config:
         self.rnn_sel_epochs = int(os.getenv("RNN_SEL_EPOCHS", os.getenv("EPOCHS", "500")))
         self.rnn_sel_imitation_epochs = int(os.getenv("RNN_SEL_IMITATION_EPOCHS", "10"))
         self.rnn_sel_lambda_len = float(os.getenv("RNN_SEL_LAMBDA_LEN", "0.05"))
+        self.rnn_sel_force_full_rollout = (
+            os.getenv("RNN_SEL_FORCE_FULL_ROLLOUT", "False").lower() == "true"
+        )
+        self.rnn_sel_global_init = (
+            os.getenv("RNN_SEL_GLOBAL_INIT", "False").lower() == "true"
+        )
+        self.rnn_sel_area_weight = float(os.getenv("RNN_SEL_AREA_WEIGHT", "0.25"))
         self.rnn_sel_success_reward = float(os.getenv("RNN_SEL_SUCCESS_REWARD", "0.5"))
         self.rnn_sel_fail_penalty = float(os.getenv("RNN_SEL_FAIL_PENALTY", "0.2"))
         self.rnn_sel_max_steps = int(os.getenv("RNN_SEL_MAX_STEPS", str(self.num_slots)))
@@ -143,6 +150,25 @@ class Config:
         self.rnn_sel_eval_disable_conf_early_exit = (
             os.getenv("RNN_SEL_EVAL_DISABLE_CONF_EARLY_EXIT", "False").lower() == "true"
         )
+        # Phase 0: reproducible SA slot init (same image -> same slots each run).
+        self.rnn_sel_sa_deterministic_slots = (
+            os.getenv("RNN_SEL_SA_DETERMINISTIC_SLOTS", "False").lower() == "true"
+        )
+        self.rnn_sel_sa_noise_seed = int(os.getenv("RNN_SEL_SA_NOISE_SEED", "0"))
+        # Phase 1: class_head prewarm before imitation (random subset prefixes; teacher = DeepSets y_hat).
+        self.rnn_sel_class_prewarm_epochs = int(os.getenv("RNN_SEL_CLASS_PREWARM_EPOCHS", "0"))
+        self.rnn_sel_prewarm_masks_per_image = int(os.getenv("RNN_SEL_PREWARM_MASKS_PER_IMAGE", "4"))
+        # Phase 3: reward shaping on full-order rollouts (detached scalars for GRPO advantage).
+        self.rnn_sel_reward_cls_acc_weight = float(os.getenv("RNN_SEL_REWARD_CLS_ACC_WEIGHT", "0.0"))
+        self.rnn_sel_reward_cls_ce_bonus = float(os.getenv("RNN_SEL_REWARD_CLS_CE_BONUS", "0.0"))
+        self.rnn_sel_grpo_class_teacher_kl = float(os.getenv("RNN_SEL_GRPO_CLASS_TEACHER_KL", "0.0"))
+        self.rnn_sel_grpo_class_teacher_temp = float(os.getenv("RNN_SEL_GRPO_CLASS_TEACHER_TEMP", "1.0"))
+        # Curriculum on DeepSets p_full threshold used for train t* (scale multiplies per-sample p_full).
+        self.rnn_sel_tstar_p_full_scale = float(os.getenv("RNN_SEL_TSTAR_P_FULL_SCALE", "1.0"))
+        self.rnn_sel_tstar_curriculum_epochs = int(os.getenv("RNN_SEL_TSTAR_CURRICULUM_EPOCHS", "0"))
+        self.rnn_sel_tstar_curriculum_start = float(os.getenv("RNN_SEL_TSTAR_CURRICULUM_START", "0.7"))
+        # Best checkpoint: val_succ (legacy) vs RNN-only GT classification accuracy.
+        self.rnn_sel_best_metric = os.getenv("RNN_SEL_BEST_METRIC", "succ").lower()
 
     def _load_trainer_config(self):
         self.epochs = int(os.getenv("EPOCHS", 500))

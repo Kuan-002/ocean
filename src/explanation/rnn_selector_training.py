@@ -3,6 +3,8 @@ Sequential slot selector training: §4.1 expert imitation + GRPO (frozen SA & De
 
 Training rollouts never use confidence-based early exit (only STOP or max_steps).
 Eval may use p>=tau early exit unless eval_disable_conf_early_exit is True.
+When force_full_rollout is enabled, train rollouts select every slot exactly once
+and reward early prefixes that reach the frozen DeepSets full-set confidence.
 """
 
 from __future__ import annotations
@@ -15,6 +17,84 @@ from src.classification.training import batch_slots
 from src.explanation.rnn_selector import SlotSelectionPolicyGRU
 
 
+@torch.no_grad()
+def run_rnn_inference_batch(
+    policy: SlotSelectionPolicyGRU,
+    slots: torch.Tensor,
+    labels: torch.Tensor,
+    tau: float,
+    force_full: bool,
+    global_init: bool,
+) -> dict:
+    """RNN-only inference for a batch. No DeepSets in the forward path."""
+    bsz, k, d = slots.shape
+    device = slots.device
+    h = policy.init_hidden_from_slots(slots) if global_init else policy.init_hidden(bsz, device)
+    selected_mask = torch.zeros(bsz, k, device=device, dtype=torch.bool)
+    done = torch.zeros(bsz, device=device, dtype=torch.bool)
+
+    final_pred = torch.zeros(bsz, device=device, dtype=torch.long)
+    final_pmax = torch.zeros(bsz, device=device)
+    final_p_true = torch.zeros(bsz, device=device)
+    steps = torch.zeros(bsz, device=device)
+    stopped = torch.zeros(bsz, device=device, dtype=torch.bool)
+
+    for step in range(k):
+        active = ~done
+        if not active.any():
+            break
+        steps = steps + active.float()
+
+        action_logits = policy.apply_action_mask(policy.forward_logits(h), selected_mask)
+        if action_logits.size(1) > k:
+            fill = torch.finfo(action_logits.dtype).min / 2
+            action_logits = action_logits.clone()
+            action_logits[:, k:] = fill
+
+        actions = action_logits.argmax(dim=-1)
+        active_idx = active.nonzero(as_tuple=True)[0]
+        selected_slots = torch.zeros(bsz, d, device=device, dtype=slots.dtype)
+        selected_slots[active_idx] = slots[active_idx, actions[active_idx]]
+        h_new = policy.step_hidden(selected_slots, h)
+        h = torch.where(active.unsqueeze(-1), h_new, h)
+
+        upd = torch.zeros_like(selected_mask)
+        upd[active_idx, actions[active_idx]] = True
+        selected_mask = selected_mask | upd
+
+        cls_logits = policy.class_head(h)
+        probs = F.softmax(cls_logits, dim=-1)
+        pred = cls_logits.argmax(dim=-1)
+        pmax = probs.max(dim=-1).values
+        p_true = probs[torch.arange(bsz, device=device), labels]
+
+        final_pred[active_idx] = pred[active_idx]
+        final_pmax[active_idx] = pmax[active_idx]
+        final_p_true[active_idx] = p_true[active_idx]
+
+        reached = active & (pmax >= tau)
+        if not force_full:
+            stopped = stopped | reached
+            done = done | reached
+
+    still = ~done
+    if still.any():
+        cls_logits = policy.class_head(h)
+        probs = F.softmax(cls_logits, dim=-1)
+        final_pred[still] = cls_logits.argmax(dim=-1)[still]
+        final_pmax[still] = probs.max(dim=-1).values[still]
+        final_p_true[still] = probs[torch.arange(bsz, device=device), labels][still]
+
+    return {
+        "pred": final_pred,
+        "pmax": final_pmax,
+        "p_true": final_p_true,
+        "steps": steps,
+        "stopped": stopped,
+        "selected_mask": selected_mask,
+    }
+
+
 class SelectorConfig:
     """Runtime config for expert, imitation, GRPO, and eval."""
 
@@ -24,6 +104,9 @@ class SelectorConfig:
         "epsilon",
         "max_steps",
         "lambda_len",
+        "force_full_rollout",
+        "global_init",
+        "area_weight",
         "success_reward",
         "fail_penalty",
         "grpo_group_size",
@@ -35,6 +118,11 @@ class SelectorConfig:
         "imitation_alpha_class",
         "eval_require_tau_to_stop",
         "eval_disable_conf_early_exit",
+        "tstar_p_full_scale",
+        "reward_cls_acc_weight",
+        "reward_cls_ce_bonus",
+        "grpo_class_teacher_kl",
+        "grpo_class_teacher_temp",
     )
 
     def __init__(
@@ -51,17 +139,28 @@ class SelectorConfig:
         grpo_beta: float,
         grpo_eps: float,
         alpha_class: float,
+        force_full_rollout: bool = False,
+        global_init: bool = False,
+        area_weight: float = 0.25,
         max_grad_norm: float = 1.0,
         grpo_adv_clip: float = 10.0,
         imitation_alpha_class: float = 2.0,
         eval_require_tau_to_stop: bool = False,
         eval_disable_conf_early_exit: bool = False,
+        tstar_p_full_scale: float = 1.0,
+        reward_cls_acc_weight: float = 0.0,
+        reward_cls_ce_bonus: float = 0.0,
+        grpo_class_teacher_kl: float = 0.0,
+        grpo_class_teacher_temp: float = 1.0,
     ) -> None:
         self.num_slots = num_slots
         self.tau = tau
         self.epsilon = epsilon
         self.max_steps = max_steps
         self.lambda_len = lambda_len
+        self.force_full_rollout = force_full_rollout
+        self.global_init = global_init
+        self.area_weight = area_weight
         self.success_reward = success_reward
         self.fail_penalty = fail_penalty
         self.grpo_group_size = grpo_group_size
@@ -73,6 +172,82 @@ class SelectorConfig:
         self.imitation_alpha_class = imitation_alpha_class
         self.eval_require_tau_to_stop = eval_require_tau_to_stop
         self.eval_disable_conf_early_exit = eval_disable_conf_early_exit
+        self.tstar_p_full_scale = tstar_p_full_scale
+        self.reward_cls_acc_weight = reward_cls_acc_weight
+        self.reward_cls_ce_bonus = reward_cls_ce_bonus
+        self.grpo_class_teacher_kl = grpo_class_teacher_kl
+        self.grpo_class_teacher_temp = grpo_class_teacher_temp
+
+
+def train_class_head_prewarm_epoch(
+    sa,
+    clf: DeepSetsClassifier,
+    policy: SlotSelectionPolicyGRU,
+    loader,
+    optimiser: torch.optim.Optimizer,
+    device: torch.device,
+    cfg: SelectorConfig,
+    masks_per_image: int,
+    slot_opts: dict | None = None,
+) -> dict:
+    """
+    Pretrain class_head (and slot embedding / GRU) on random-prefix states.
+    Teacher label = argmax DeepSets(slots, None). action_head gradients are disabled.
+    """
+    policy.train()
+    clf.eval()
+    sa.eval()
+    slot_kw = slot_opts or {}
+    k = cfg.num_slots
+    meter = {"prewarm_loss": 0.0, "n": 0}
+
+    prev_action_req: list[bool] = []
+    for p in policy.action_head.parameters():
+        prev_action_req.append(p.requires_grad)
+        p.requires_grad_(False)
+    try:
+        for images, _, gt_labels in loader:
+            images = images.to(device)
+            gt_labels = gt_labels.to(device)
+            bsz = images.size(0)
+            with torch.no_grad():
+                slots = batch_slots(sa, images, device, **slot_kw)
+
+            total_loss = torch.zeros((), device=device)
+            n_terms = 0
+            for bi in range(bsz):
+                s = slots[bi : bi + 1]
+                gt_bi = gt_labels[bi : bi + 1]
+                for _ in range(masks_per_image):
+                    kk = int(torch.randint(1, k + 1, (1,), device=device).item())
+                    perm = torch.randperm(k, device=device)[:kk]
+                    h = (
+                        policy.init_hidden_from_slots(s)
+                        if cfg.global_init
+                        else policy.init_hidden(1, device)
+                    )
+                    for j in range(kk):
+                        pj = int(perm[j].item())
+                        h = policy.step_hidden(s[:, pj], h)
+                    logits = policy.class_head(h)
+                    total_loss = total_loss + F.cross_entropy(logits, gt_bi)
+                    n_terms += 1
+
+            loss = total_loss / max(n_terms, 1)
+            optimiser.zero_grad(set_to_none=True)
+            loss.backward()
+            if cfg.max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(policy.parameters(), cfg.max_grad_norm)
+            optimiser.step()
+
+            meter["prewarm_loss"] += float(loss.detach().item()) * bsz
+            meter["n"] += bsz
+    finally:
+        for p, was in zip(policy.action_head.parameters(), prev_action_req):
+            p.requires_grad_(was)
+
+    n = max(meter["n"], 1)
+    return {"prewarm_loss": meter["prewarm_loss"] / n}
 
 
 @torch.no_grad()
@@ -88,6 +263,39 @@ def build_expert_batch(
     bsz, k, _ = slots.shape
     device = slots.device
     dtype = slots.dtype
+
+    if cfg.force_full_rollout:
+        selected = torch.zeros(bsz, k, device=device, dtype=dtype)
+        sequences: list[list[int]] = [[] for _ in range(bsz)]
+        b_range = torch.arange(bsz, device=device)
+
+        for _ in range(k):
+            logits_s = clf(slots, selected)
+            p_s = F.softmax(logits_s, dim=-1)[b_range, y_hat_full]
+            b_idx = b_range.unsqueeze(1).expand(bsz, k).reshape(bsz * k)
+            j_idx = torch.arange(k, device=device).unsqueeze(0).expand(bsz, k).reshape(bsz * k)
+            slot_stacked = slots[b_idx]
+            sel2 = selected[b_idx].clone()
+            row = torch.arange(bsz * k, device=device)
+            sel2[row, j_idx] = torch.where(
+                selected[b_idx, j_idx] < 0.5,
+                torch.ones((), device=device, dtype=dtype),
+                sel2[row, j_idx],
+            )
+            logits_c = clf(slot_stacked, sel2)
+            p_cand = F.softmax(logits_c, dim=-1)[row, y_hat_full[b_idx]]
+            gain = (p_cand - p_s[b_idx]).view(bsz, k)
+            gain = gain.masked_fill(selected > 0.5, float("-inf"))
+            best_j = gain.argmax(dim=1)
+
+            for bi, act in enumerate(best_j.tolist()):
+                sequences[bi].append(int(act))
+            selected[b_range, best_j] = 1.0
+
+        padded = torch.tensor(sequences, device=device, dtype=torch.long)
+        mask = torch.ones(bsz, k, device=device, dtype=torch.bool)
+        return padded, mask
+
     selected = torch.zeros(bsz, k, device=device, dtype=dtype)
     thresh = torch.maximum(torch.full_like(p_full, cfg.tau), p_full - cfg.epsilon)
     active = torch.ones(bsz, dtype=torch.bool, device=device)
@@ -147,6 +355,7 @@ def train_imitation_epoch(
     optimiser: torch.optim.Optimizer,
     device: torch.device,
     cfg: SelectorConfig,
+    slot_opts: dict | None = None,
 ) -> dict:
     """
     Supervise action_head on expert actions; supervise class_head after each slot GRU step
@@ -157,10 +366,12 @@ def train_imitation_epoch(
     sa.eval()
     meter = {"imitation_loss": 0.0, "imitation_cls_loss": 0.0, "n": 0}
 
-    for images, _, _ in loader:
+    slot_kw = slot_opts or {}
+    for images, _, gt_labels in loader:
         images = images.to(device)
+        gt_labels = gt_labels.to(device)
         with torch.no_grad():
-            slots = batch_slots(sa, images, device)
+            slots = batch_slots(sa, images, device, **slot_kw)
             logits_full = clf(slots, None)
             probs_full = F.softmax(logits_full, dim=-1)
             y_hat = logits_full.argmax(dim=-1)
@@ -168,7 +379,7 @@ def train_imitation_epoch(
             targets, targ_mask = build_expert_batch(clf, slots, y_hat, p_full, policy.stop_idx, cfg)
 
         bsz, k, d = slots.shape
-        h = policy.init_hidden(bsz, device)
+        h = policy.init_hidden_from_slots(slots) if cfg.global_init else policy.init_hidden(bsz, device)
         selected_mask = torch.zeros(bsz, k, device=device, dtype=torch.bool)
         max_len = targets.size(1)
         total_loss = torch.zeros((), device=device)
@@ -196,7 +407,7 @@ def train_imitation_epoch(
 
                 if cfg.imitation_alpha_class > 0:
                     cls_logits = policy.class_head(h)
-                    cls_loss = F.cross_entropy(cls_logits[idx], y_hat[idx], reduction="mean")
+                    cls_loss = F.cross_entropy(cls_logits[idx], gt_labels[idx], reduction="mean")
                     total_loss = total_loss + cfg.imitation_alpha_class * cls_loss
                     cls_accum = cls_accum + cls_loss.detach()
                     cls_steps += 1
@@ -222,6 +433,193 @@ def train_imitation_epoch(
     return out
 
 
+def _run_full_order_rollout(
+    policy: SlotSelectionPolicyGRU,
+    ref_policy: SlotSelectionPolicyGRU,
+    slots: torch.Tensor,
+    y_hat_full: torch.Tensor,
+    cfg: SelectorConfig,
+    train: bool,
+    action_trace: list[torch.Tensor] | None,
+    clf: DeepSetsClassifier | None,
+    p_full: torch.Tensor | None,
+    gt_labels: torch.Tensor | None = None,
+) -> dict:
+    """Select every slot during training; score by first prefix reaching p_full."""
+    if train and (clf is None or p_full is None):
+        raise ValueError("force_full_rollout training requires clf and p_full")
+
+    bsz, k, d = slots.shape
+    device = slots.device
+    h = policy.init_hidden_from_slots(slots) if cfg.global_init else policy.init_hidden(bsz, device)
+    selected_mask = torch.zeros(bsz, k, device=device, dtype=torch.bool)
+    done = torch.zeros(bsz, device=device, dtype=torch.bool)
+    h_dim = h.size(-1)
+    num_cls = policy.num_classes
+    h_final = torch.zeros(bsz, h_dim, device=device)
+    cls_logits_final = torch.zeros(bsz, num_cls, device=device)
+
+    log_probs_steps: list[torch.Tensor] = []
+    kl_steps: list[torch.Tensor] = []
+    valid_steps: list[torch.Tensor] = []
+    cls_logits_steps: list[torch.Tensor] = []
+    cls_valid_steps: list[torch.Tensor] = []
+    prefix_conf_steps: list[torch.Tensor] = []
+    episode_len = torch.zeros(bsz, device=device)
+
+    class_kl_steps: list[torch.Tensor] = []
+
+    t_star = torch.full((bsz,), k, device=device, dtype=torch.long)
+    t_star_found = torch.zeros(bsz, device=device, dtype=torch.bool)
+    if p_full is not None:
+        threshold = (p_full.to(device) * cfg.tstar_p_full_scale).clamp(min=0.05, max=1.0)
+    else:
+        threshold = torch.full((bsz,), cfg.tau, device=device)
+    b_range = torch.arange(bsz, device=device)
+
+    for step in range(k):
+        active = ~done
+        if not active.any():
+            break
+        episode_len = episode_len + active.float()
+
+        logits = policy.apply_action_mask(policy.forward_logits(h), selected_mask)
+        with torch.no_grad():
+            lr = ref_policy.apply_action_mask(ref_policy.forward_logits(h), selected_mask)
+        if logits.size(1) > k:
+            fill = torch.finfo(logits.dtype).min / 2
+            logits = logits.clone()
+            logits[:, k:] = fill
+            lr = lr.clone()
+            lr[:, k:] = fill
+
+        if not torch.isfinite(logits).all():
+            raise RuntimeError(
+                "Non-finite action logits in run_grpo_rollout. "
+                "Lower RNN_SEL_LR / RNN_SEL_ALPHA_CLASS, tighten RNN_SEL_MAX_GRAD_NORM, "
+                "or raise RNN_SEL_GRPO_ADV_CLIP; use CUDA_LAUNCH_BLOCKING=1."
+            )
+
+        log_pt = F.log_softmax(logits, dim=-1)
+        log_pref = F.log_softmax(lr, dim=-1)
+        pt = log_pt.exp()
+        kl = (pt * (log_pt - log_pref)).sum(dim=-1)
+
+        dist = torch.distributions.Categorical(logits=logits)
+        actions = dist.sample() if train else logits.argmax(dim=-1)
+        if action_trace is not None:
+            action_trace.append(actions.detach().clone())
+        log_prob = dist.log_prob(actions)
+
+        log_probs_steps.append(torch.where(active, log_prob, torch.zeros_like(log_prob)))
+        kl_steps.append(torch.where(active, kl, torch.zeros_like(kl)))
+        valid_steps.append(active.float())
+
+        ss = torch.zeros(bsz, d, device=device, dtype=slots.dtype)
+        b_idx = active.nonzero(as_tuple=True)[0]
+        ss[b_idx] = slots[b_idx, actions[b_idx]]
+        h_new = policy.step_hidden(ss, h)
+        h = torch.where(active.unsqueeze(-1), h_new, h)
+        upd = torch.zeros_like(selected_mask)
+        upd[b_idx, actions[b_idx]] = True
+        selected_mask = selected_mask | upd
+
+        cls_logits = policy.class_head(h)
+        cls_logits_steps.append(cls_logits)
+        cls_valid_steps.append(active.float())
+
+        with torch.no_grad():
+            if clf is not None:
+                prefix_logits = clf(slots, selected_mask.float())
+                prefix_conf = F.softmax(prefix_logits, dim=-1)[b_range, y_hat_full]
+            else:
+                prefix_logits = None
+                prefix_conf = cls_logits.softmax(-1).max(-1).values
+        prefix_conf_steps.append(prefix_conf)
+
+        if train and cfg.grpo_class_teacher_kl > 0 and prefix_logits is not None:
+            T = cfg.grpo_class_teacher_temp
+            with torch.no_grad():
+                t_lp = F.log_softmax(prefix_logits / T, dim=-1)
+                t_p = t_lp.exp()
+            s_lp = F.log_softmax(cls_logits / T, dim=-1)
+            kl_cls = (t_p * (t_lp - s_lp)).sum(dim=-1)
+            class_kl_steps.append(torch.where(active, kl_cls, torch.zeros_like(kl_cls)))
+
+        just_reached = active & ~t_star_found & (prefix_conf >= threshold)
+        t_star[just_reached] = step + 1
+        t_star_found = t_star_found | just_reached
+
+        should_stop = torch.zeros(bsz, device=device, dtype=torch.bool)
+        if (not train) and (not cfg.eval_disable_conf_early_exit):
+            should_stop = cls_logits.softmax(-1).max(-1).values >= cfg.tau
+        if should_stop.any():
+            si = (active & should_stop).nonzero(as_tuple=True)[0]
+            h_final[si] = h[si]
+            cls_logits_final[si] = cls_logits[si]
+            done[si] = True
+
+    still = ~done
+    if still.any():
+        h_final[still] = h[still]
+        cls_logits_final[still] = policy.class_head(h[still])
+
+    log_st = torch.stack(log_probs_steps, dim=0)
+    kl_st = torch.stack(kl_steps, dim=0)
+    val_st = torch.stack(valid_steps, dim=0)
+    per_traj_logp = (log_st * val_st).sum(dim=0)
+    kl_mean = (kl_st * val_st).sum() / val_st.sum().clamp(min=1.0)
+
+    prefix_conf_stack = torch.stack(prefix_conf_steps, dim=0)
+    prefix_valid = torch.stack(valid_steps, dim=0)
+    area = (prefix_conf_stack * prefix_valid).sum(dim=0) / prefix_valid.sum(dim=0).clamp(min=1.0)
+    R_tstar = 1.0 - (t_star.float() / float(k))
+    R = R_tstar + cfg.area_weight * area
+
+    if cfg.reward_cls_acc_weight > 0 or cfg.reward_cls_ce_bonus > 0:
+        pred = cls_logits_final.argmax(dim=-1)
+        if cfg.reward_cls_acc_weight > 0:
+            R = R + cfg.reward_cls_acc_weight * (pred == y_hat_full).float()
+        if cfg.reward_cls_ce_bonus > 0:
+            ce_f = F.cross_entropy(cls_logits_final, y_hat_full, reduction="none")
+            R = R + cfg.reward_cls_ce_bonus * (1.0 - ce_f.clamp(0.0, 2.0)).detach()
+
+    if class_kl_steps:
+        kl_class_stack = torch.stack(class_kl_steps, dim=0)
+        kl_class_mean = (kl_class_stack * prefix_valid).sum() / prefix_valid.sum().clamp(min=1.0)
+    else:
+        kl_class_mean = torch.zeros((), device=device)
+
+    cls_stack = torch.stack(cls_logits_steps, dim=0)
+    cls_valid = torch.stack(cls_valid_steps, dim=0)
+    _cls_target = gt_labels if gt_labels is not None else y_hat_full
+    ce_steps = F.cross_entropy(
+        cls_stack.reshape(-1, num_cls),
+        _cls_target.unsqueeze(0).expand(cls_stack.size(0), bsz).reshape(-1),
+        reduction="none",
+    ).view(cls_stack.size(0), bsz)
+    L_class = (ce_steps * cls_valid).sum() / cls_valid.sum().clamp(min=1.0)
+
+    p_conf = cls_logits_final.softmax(-1).max(-1).values
+    return {
+        "R": R,
+        "per_traj_logp": per_traj_logp,
+        "kl_mean": kl_mean,
+        "L_class": L_class,
+        "cls_logits_final": cls_logits_final,
+        "subset_norm": selected_mask.float().sum(dim=-1) / float(cfg.num_slots),
+        "p_conf": p_conf,
+        "stopped_with_stop": torch.zeros(bsz, device=device, dtype=torch.bool),
+        "timed_out": torch.zeros(bsz, device=device, dtype=torch.bool),
+        "selected_mask": selected_mask,
+        "episode_len": episode_len,
+        "t_star": t_star,
+        "t_star_found": t_star_found,
+        "prefix_conf_area": area,
+        "kl_class_mean": kl_class_mean,
+    }
+
+
 def run_grpo_rollout(
     policy: SlotSelectionPolicyGRU,
     ref_policy: SlotSelectionPolicyGRU,
@@ -230,14 +628,25 @@ def run_grpo_rollout(
     cfg: SelectorConfig,
     train: bool,
     action_trace: list[torch.Tensor] | None = None,
+    clf: DeepSetsClassifier | None = None,
+    p_full: torch.Tensor | None = None,
+    gt_labels: torch.Tensor | None = None,
 ) -> dict:
     """
     train=True: sample actions; end only via STOP or max_steps (no p>=tau early exit).
     train=False: greedy; optional mask STOP until tau; optional p>=tau early exit after slot.
+    In force_full_rollout mode, train=True selects all slots exactly once with no STOP.
+    gt_labels: ground-truth class labels used for L_class; y_hat_full is kept for reward shaping only.
     """
+    if cfg.force_full_rollout:
+        return _run_full_order_rollout(
+            policy, ref_policy, slots, y_hat_full, cfg, train, action_trace, clf, p_full,
+            gt_labels=gt_labels,
+        )
+
     bsz, k, d = slots.shape
     device = slots.device
-    h = policy.init_hidden(bsz, device)
+    h = policy.init_hidden_from_slots(slots) if cfg.global_init else policy.init_hidden(bsz, device)
     selected_mask = torch.zeros(bsz, k, device=device, dtype=torch.bool)
     done = torch.zeros(bsz, device=device, dtype=torch.bool)
     h_dim = h.size(-1)
@@ -361,7 +770,8 @@ def run_grpo_rollout(
     per_traj_logp = (log_st * val_st).sum(dim=0)
     kl_mean = (kl_st * val_st).sum() / val_st.sum().clamp(min=1.0)
 
-    L_class = F.cross_entropy(cls_logits_final, y_hat_full, reduction="mean")
+    _cls_target = gt_labels if gt_labels is not None else y_hat_full
+    L_class = F.cross_entropy(cls_logits_final, _cls_target, reduction="mean")
 
     return {
         "R": R,
@@ -387,6 +797,7 @@ def train_grpo_epoch(
     optimiser: torch.optim.Optimizer,
     device: torch.device,
     cfg: SelectorConfig,
+    slot_opts: dict | None = None,
 ) -> dict:
     policy.train()
     ref_policy.eval()
@@ -402,21 +813,38 @@ def train_grpo_epoch(
         "success_rate": 0.0,
         "avg_subset_size": 0.0,
         "avg_final_p": 0.0,
+        "avg_t_star": 0.0,
         "n": 0,
     }
 
-    for images, _, _ in loader:
+    slot_kw = slot_opts or {}
+    for images, _, gt_labels in loader:
         images = images.to(device)
+        gt_labels = gt_labels.to(device)
         bsz = images.size(0)
         with torch.no_grad():
-            slots = batch_slots(sa, images, device)
+            slots = batch_slots(sa, images, device, **slot_kw)
             logits_full = clf(slots, None)
+            probs_full = F.softmax(logits_full, dim=-1)
             y_hat = logits_full.argmax(dim=-1)
+            p_full = probs_full[torch.arange(bsz, device=device), y_hat]
 
         slots_e = slots.repeat_interleave(g, dim=0)
         y_hat_e = y_hat.repeat_interleave(g, dim=0)
+        p_full_e = p_full.repeat_interleave(g, dim=0)
+        gt_labels_e = gt_labels.repeat_interleave(g, dim=0)
         try:
-            out = run_grpo_rollout(policy, ref_policy, slots_e, y_hat_e, cfg, train=True)
+            out = run_grpo_rollout(
+                policy,
+                ref_policy,
+                slots_e,
+                y_hat_e,
+                cfg,
+                train=True,
+                clf=clf,
+                p_full=p_full_e,
+                gt_labels=gt_labels_e,
+            )
         except (RuntimeError, ValueError) as err:
             msg = str(err)
             if "Non-finite action logits" in msg or (
@@ -443,6 +871,8 @@ def train_grpo_epoch(
         L_grpo = loss_pg + loss_kl
         L_class = out["L_class"]
         loss = L_grpo + cfg.alpha_class * L_class
+        if cfg.grpo_class_teacher_kl > 0 and "kl_class_mean" in out:
+            loss = loss + cfg.grpo_class_teacher_kl * out["kl_class_mean"]
 
         if not torch.isfinite(loss):
             optimiser.zero_grad(set_to_none=True)
@@ -465,10 +895,47 @@ def train_grpo_epoch(
         meter["success_rate"] += float(succ.float().mean().item()) * bsz
         meter["avg_subset_size"] += float(k_avg.item()) * bsz
         meter["avg_final_p"] += float(out["p_conf"].mean().item()) * bsz
+        if "t_star" in out:
+            meter["avg_t_star"] += float(out["t_star"].float().mean().item()) * bsz
         meter["n"] += bsz
 
     n = max(meter["n"], 1)
     return {k: (v / n if k != "n" else v) for k, v in meter.items()}
+
+
+@torch.no_grad()
+def eval_rnn_classifier_accuracy(
+    sa,
+    policy: SlotSelectionPolicyGRU,
+    loader,
+    device: torch.device,
+    cfg: SelectorConfig,
+    max_samples: int | None = None,
+    slot_opts: dict | None = None,
+) -> float:
+    """Ground-truth classification accuracy with RNN-only greedy rollout (no DeepSets)."""
+    policy.eval()
+    sa.eval()
+    slot_kw = slot_opts or {}
+    correct = 0
+    total = 0
+    for batch in loader:
+        images = batch[0].to(device)
+        labels = batch[2].to(device)
+        slots = batch_slots(sa, images, device, **slot_kw)
+        out = run_rnn_inference_batch(
+            policy,
+            slots,
+            labels,
+            cfg.tau,
+            cfg.force_full_rollout,
+            cfg.global_init,
+        )
+        correct += int((out["pred"] == labels).sum().item())
+        total += labels.size(0)
+        if max_samples is not None and total >= max_samples:
+            break
+    return correct / max(total, 1)
 
 
 @torch.no_grad()
@@ -479,6 +946,8 @@ def eval_rnn_selector(
     device: torch.device,
     cfg: SelectorConfig,
     max_samples: int | None = None,
+    clf: DeepSetsClassifier | None = None,
+    slot_opts: dict | None = None,
 ) -> dict:
     policy.eval()
     sa.eval()
@@ -489,15 +958,33 @@ def eval_rnn_selector(
         "avg_final_p": 0.0,
         "mean_R": 0.0,
         "mean_steps": 0.0,
+        "avg_t_star": 0.0,
     }
 
     ref_policy = policy
+    slot_kw = slot_opts or {}
 
     for batch in loader:
         images = batch[0].to(device)
         labels = batch[2].to(device)
-        slots = batch_slots(sa, images, device)
-        out = run_grpo_rollout(policy, ref_policy, slots, labels, cfg, train=False)
+        slots = batch_slots(sa, images, device, **slot_kw)
+        if cfg.force_full_rollout and clf is not None:
+            logits_full = clf(slots, None)
+            probs_full = F.softmax(logits_full, dim=-1)
+            y_hat = logits_full.argmax(dim=-1)
+            p_full = probs_full[torch.arange(slots.size(0), device=device), y_hat]
+            out = run_grpo_rollout(
+                policy,
+                ref_policy,
+                slots,
+                y_hat,
+                cfg,
+                train=False,
+                clf=clf,
+                p_full=p_full,
+            )
+        else:
+            out = run_grpo_rollout(policy, ref_policy, slots, labels, cfg, train=False)
         ce = F.cross_entropy(out["cls_logits_final"], labels, reduction="none")
         subset_norm = out["selected_mask"].float().sum(-1) / float(cfg.num_slots)
         R = -ce - cfg.lambda_len * subset_norm
@@ -508,6 +995,8 @@ def eval_rnn_selector(
         acc["avg_final_p"] += float(out["p_conf"].mean().item()) * b
         acc["mean_R"] += float(R.mean().item()) * b
         acc["mean_steps"] += float(out["episode_len"].mean().item()) * b
+        if "t_star" in out:
+            acc["avg_t_star"] += float(out["t_star"].float().mean().item()) * b
         total += b
         if max_samples is not None and total >= max_samples:
             break

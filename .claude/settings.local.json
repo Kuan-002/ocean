@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Get-ChildItem -Path \"D:\\\\ocean2\\\\ocean\" -Recurse -File -Exclude .git,__pycache__,node_modules)",
+      "Bash(Select-Object -ExpandProperty FullName)",
+      "Bash(Sort-Object)",
+      "Bash(find *)",
+      "Bash(xargs wc -l)",
+      "Bash(dir \"D:\\\\ocean2\\\\ocean\\\\scripts\" /b)",
+      "Bash(dir \"D:\\\\ocean2\\\\ocean\\\\docs\" /b)"
+    ]
+  }
+}

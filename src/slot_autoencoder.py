@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from torch import Tensor
-from typing import Tuple
+from typing import Optional, Tuple
 from src.slot_attention import SlotAttention
 from torch.optim import AdamW
 
@@ -57,14 +57,16 @@ class SlotAutoencoder(nn.Module):
         if config.use_gpu:
             self.cuda()
 
-    def forward_slots_only(self, x: Tensor) -> Tuple[Tensor, Tensor]:
+    def forward_slots_only(
+        self, x: Tensor, slot_init_noise: Optional[Tensor] = None
+    ) -> Tuple[Tensor, Tensor]:
         """Encode images to slot vectors without running the decoder (plan: reuse for explanation)."""
         x = self.encoder(x)
         x = self.mlp(x.reshape(*x.shape[:2], -1).permute(0, 2, 1))
-        slots, attn = self.slot_attention(x)
+        slots, attn = self.slot_attention(x, slot_init_noise=slot_init_noise)
         return slots, attn
 
-    def forward(self, x: Tensor):
+    def forward(self, x: Tensor, slot_init_noise: Optional[Tensor] = None):
         # b: batch_size, c: channels, h: height, w: width, d: out_channels
         b, c, h, w = x.shape
         # (b, d, h, w)
@@ -73,7 +75,7 @@ class SlotAutoencoder(nn.Module):
         enc = self.mlp(enc.reshape(*enc.shape[:2], -1).permute(0, 2, 1))  # flatten img
 
         # (b, num_slots, slot_dim)
-        slots, attn = self.slot_attention(enc)
+        slots, attn = self.slot_attention(enc, slot_init_noise=slot_init_noise)
 
         return self._decode_slots_to_recon(b, c, h, w, slots, attn)
 
