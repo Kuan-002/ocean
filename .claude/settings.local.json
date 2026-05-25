@@ -1,7 +1,11 @@
 {
   "permissions": {
     "allow": [
-      "Bash(grep -E \"\\\\.\\(py|sh|md|txt\\)$\")"
+      "Bash(grep -E \"\\\\.\\(py|sh|md|txt\\)$\")",
+      "Bash(git -C /vol/biomedic3/kw1025/ocean diff -- scripts/envs/)",
+      "Bash(sort -t_ -k1 -n)",
+      "Bash(chmod +x *)",
+      "Bash(python *)"
     ]
   }
 }

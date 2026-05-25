@@ -61,6 +61,7 @@ def run_rnn_inference_trace(
     device = slots.device
     h = policy.init_hidden_from_slots(slots) if global_init else policy.init_hidden(1, device)
     selected_mask = torch.zeros(1, k, device=device, dtype=torch.bool)
+    slot_embeds = policy.precompute_slot_embeds(slots)
     trace: list[dict] = []
 
     for step in range(k):
@@ -74,7 +75,7 @@ def run_rnn_inference_trace(
         h = policy.step_hidden(slots[:, slot_id], h)
         selected_mask[0, slot_id] = True
 
-        cls_logits = policy.class_head(h)
+        cls_logits, _ = policy.class_head(h, slot_embeds, selected_mask)
         probs = F.softmax(cls_logits, dim=-1)
         pred = int(cls_logits.argmax(dim=-1).item())
         pmax = float(probs.max(dim=-1).values.item())

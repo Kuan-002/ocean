@@ -165,12 +165,22 @@ class Config:
         self.rnn_sel_reward_cls_ce_bonus = float(os.getenv("RNN_SEL_REWARD_CLS_CE_BONUS", "0.0"))
         self.rnn_sel_grpo_class_teacher_kl = float(os.getenv("RNN_SEL_GRPO_CLASS_TEACHER_KL", "0.0"))
         self.rnn_sel_grpo_class_teacher_temp = float(os.getenv("RNN_SEL_GRPO_CLASS_TEACHER_TEMP", "1.0"))
+        # eval_min_slots: minimum slots selected before early exit is allowed in eval.
+        self.rnn_sel_eval_min_slots = int(os.getenv("RNN_SEL_EVAL_MIN_SLOTS", "0"))
+        # area_decay_alpha in (0,1): exponential decay weight over steps (0 = flat/uniform).
+        self.rnn_sel_area_decay_alpha = float(os.getenv("RNN_SEL_AREA_DECAY_ALPHA", "0.0"))
         # Curriculum on DeepSets p_full threshold used for train t* (scale multiplies per-sample p_full).
         self.rnn_sel_tstar_p_full_scale = float(os.getenv("RNN_SEL_TSTAR_P_FULL_SCALE", "1.0"))
         self.rnn_sel_tstar_curriculum_epochs = int(os.getenv("RNN_SEL_TSTAR_CURRICULUM_EPOCHS", "0"))
         self.rnn_sel_tstar_curriculum_start = float(os.getenv("RNN_SEL_TSTAR_CURRICULUM_START", "0.7"))
         # Best checkpoint: val_succ (legacy) vs RNN-only GT classification accuracy.
         self.rnn_sel_best_metric = os.getenv("RNN_SEL_BEST_METRIC", "succ").lower()
+        # Rule+Ranking GRPO reward
+        self.rnn_sel_reward_rule_weight = float(os.getenv("RNN_SEL_REWARD_RULE_WEIGHT", "1.0"))
+        self.rnn_sel_reward_rank_weight = float(os.getenv("RNN_SEL_REWARD_RANK_WEIGHT", "0.0"))
+        self.rnn_sel_reward_area_ptrue_weight = float(os.getenv("RNN_SEL_REWARD_AREA_PTRUE_WEIGHT", "0.0"))
+        self.rnn_sel_kl_step_ramp = os.getenv("RNN_SEL_KL_STEP_RAMP", "False").lower() == "true"
+        self.rnn_sel_lclass_step_ramp = os.getenv("RNN_SEL_LCLASS_STEP_RAMP", "False").lower() == "true"
 
     def _load_trainer_config(self):
         self.epochs = int(os.getenv("EPOCHS", 500))

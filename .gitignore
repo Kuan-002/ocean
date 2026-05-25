@@ -8,12 +8,12 @@ __pycache__/
 .eggs/
 dist/
 build/
-out/
 bin/
-lib/
-lib64/
+out/
 examples/
-scripts/datasets
+scripts/datasets/
+scripts/envs/
+.claude/
 # Tests / coverage
 .pytest_cache/
 .coverage
@@ -23,8 +23,8 @@ htmlcov/
 #/.env
 
 # Checkpoints, runs, datasets (large)
-out/
 
+slurm.sh
 # Logs / OS
 *.log
 .DS_Store

@@ -18,7 +18,7 @@ from tqdm import tqdm
 
 from src.clevr_hans_dataset import setup_dataloaders
 from src.classification.checkpoints import load_deepsets_checkpoint
-from src.classification.deepsets import DeepSetsClassifier
+from src.classification.deepsets import DeepSetsClassifier, EnhancedDeepSetsClassifier
 from src.config import Config
 from src.explanation.rnn_selector import SlotSelectionPolicyGRU
 from src.explanation.rnn_selector_training import (
@@ -102,14 +102,26 @@ def main() -> None:
     for p in sa.parameters():
         p.requires_grad = False
 
-    clf = DeepSetsClassifier(
-        slot_dim=config.slot_dim,
-        phi_hidden=config.ds_phi_hidden,
-        rho_hidden=config.ds_rho_hidden,
-        num_classes=config.ds_num_classes,
-        aggregate=config.ds_aggregate,
-    ).to(device)
-    clf.load_state_dict(load_deepsets_checkpoint(cls_ckpt, map_location=device)[0])
+    cls_sd, cls_meta = load_deepsets_checkpoint(cls_ckpt, map_location=device)
+    if cls_meta.get("enhanced", False):
+        clf = EnhancedDeepSetsClassifier(
+            slot_dim=config.slot_dim,
+            phi_hidden=config.ds_phi_hidden,
+            rho_hidden=config.ds_rho_hidden,
+            num_classes=config.ds_num_classes,
+            dropout=config.ds_dropout,
+        ).to(device)
+        print(f"[EnhancedDeepSets] loaded phi_hidden={config.ds_phi_hidden} rho_hidden={config.ds_rho_hidden}")
+    else:
+        clf = DeepSetsClassifier(
+            slot_dim=config.slot_dim,
+            phi_hidden=config.ds_phi_hidden,
+            rho_hidden=config.ds_rho_hidden,
+            num_classes=config.ds_num_classes,
+            aggregate=config.ds_aggregate,
+        ).to(device)
+        print(f"[DeepSetsClassifier] loaded phi_hidden={config.ds_phi_hidden} rho_hidden={config.ds_rho_hidden}")
+    clf.load_state_dict(cls_sd)
     clf.eval()
     for p in clf.parameters():
         p.requires_grad = False
@@ -132,6 +144,7 @@ def main() -> None:
         force_full_rollout=config.rnn_sel_force_full_rollout,
         global_init=config.rnn_sel_global_init,
         area_weight=config.rnn_sel_area_weight,
+        area_decay_alpha=config.rnn_sel_area_decay_alpha,
         success_reward=config.rnn_sel_success_reward,
         fail_penalty=config.rnn_sel_fail_penalty,
         grpo_group_size=config.rnn_sel_grpo_group_size,
@@ -143,11 +156,17 @@ def main() -> None:
         imitation_alpha_class=config.rnn_sel_imitation_alpha_class,
         eval_require_tau_to_stop=config.rnn_sel_eval_require_tau_to_stop,
         eval_disable_conf_early_exit=config.rnn_sel_eval_disable_conf_early_exit,
+        eval_min_slots=config.rnn_sel_eval_min_slots,
         tstar_p_full_scale=config.rnn_sel_tstar_p_full_scale,
         reward_cls_acc_weight=config.rnn_sel_reward_cls_acc_weight,
         reward_cls_ce_bonus=config.rnn_sel_reward_cls_ce_bonus,
         grpo_class_teacher_kl=config.rnn_sel_grpo_class_teacher_kl,
         grpo_class_teacher_temp=config.rnn_sel_grpo_class_teacher_temp,
+        reward_rule_weight=config.rnn_sel_reward_rule_weight,
+        reward_rank_weight=config.rnn_sel_reward_rank_weight,
+        reward_area_ptrue_weight=config.rnn_sel_reward_area_ptrue_weight,
+        kl_step_ramp=config.rnn_sel_kl_step_ramp,
+        lclass_step_ramp=config.rnn_sel_lclass_step_ramp,
     )
 
     optimiser = torch.optim.AdamW(
@@ -254,8 +273,10 @@ def main() -> None:
         print(
             f"epoch={epoch} loss={train_stats['loss']:.4f} "
             f"L_grpo={train_stats['L_grpo']:.4f} L_class={train_stats['L_class']:.4f} "
-            f"train_succ={train_stats['success_rate']:.4f} train_k={train_stats['avg_subset_size']:.2f} "
-            f"val_succ={val_stats['success_rate']:.4f} val_k={val_stats['avg_subset_size']:.2f} "
+            f"train_succ={train_stats['success_rate']:.4f} train_gtacc={train_stats['gt_acc']:.4f} "
+            f"train_k={train_stats['avg_subset_size']:.2f} "
+            f"val_succ={val_stats['success_rate']:.4f} val_gtacc={val_stats['gt_acc']:.4f} "
+            f"val_k={val_stats['avg_subset_size']:.2f} "
             f"val_rnn_acc={val_rnn_acc:.4f} val_p={val_stats['avg_final_p']:.4f} "
             f"train_t*={train_stats['avg_t_star']:.2f} val_t*={val_stats['avg_t_star']:.2f} "
             f"tstar_scale={sel_cfg.tstar_p_full_scale:.3f}"

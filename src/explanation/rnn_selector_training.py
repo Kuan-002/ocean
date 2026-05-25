@@ -32,6 +32,7 @@ def run_rnn_inference_batch(
     h = policy.init_hidden_from_slots(slots) if global_init else policy.init_hidden(bsz, device)
     selected_mask = torch.zeros(bsz, k, device=device, dtype=torch.bool)
     done = torch.zeros(bsz, device=device, dtype=torch.bool)
+    slot_embeds = policy.precompute_slot_embeds(slots)  # [B, K, embed_dim]
 
     final_pred = torch.zeros(bsz, device=device, dtype=torch.long)
     final_pmax = torch.zeros(bsz, device=device)
@@ -62,7 +63,7 @@ def run_rnn_inference_batch(
         upd[active_idx, actions[active_idx]] = True
         selected_mask = selected_mask | upd
 
-        cls_logits = policy.class_head(h)
+        cls_logits, _ = policy.class_head(h, slot_embeds, selected_mask)
         probs = F.softmax(cls_logits, dim=-1)
         pred = cls_logits.argmax(dim=-1)
         pmax = probs.max(dim=-1).values
@@ -79,7 +80,7 @@ def run_rnn_inference_batch(
 
     still = ~done
     if still.any():
-        cls_logits = policy.class_head(h)
+        cls_logits, _ = policy.class_head(h, slot_embeds, selected_mask)
         probs = F.softmax(cls_logits, dim=-1)
         final_pred[still] = cls_logits.argmax(dim=-1)[still]
         final_pmax[still] = probs.max(dim=-1).values[still]
@@ -107,6 +108,7 @@ class SelectorConfig:
         "force_full_rollout",
         "global_init",
         "area_weight",
+        "area_decay_alpha",
         "success_reward",
         "fail_penalty",
         "grpo_group_size",
@@ -118,11 +120,17 @@ class SelectorConfig:
         "imitation_alpha_class",
         "eval_require_tau_to_stop",
         "eval_disable_conf_early_exit",
+        "eval_min_slots",
         "tstar_p_full_scale",
         "reward_cls_acc_weight",
         "reward_cls_ce_bonus",
         "grpo_class_teacher_kl",
         "grpo_class_teacher_temp",
+        "reward_rule_weight",
+        "reward_rank_weight",
+        "reward_area_ptrue_weight",
+        "kl_step_ramp",
+        "lclass_step_ramp",
     )
 
     def __init__(
@@ -142,16 +150,23 @@ class SelectorConfig:
         force_full_rollout: bool = False,
         global_init: bool = False,
         area_weight: float = 0.25,
+        area_decay_alpha: float = 0.0,
         max_grad_norm: float = 1.0,
         grpo_adv_clip: float = 10.0,
         imitation_alpha_class: float = 2.0,
         eval_require_tau_to_stop: bool = False,
         eval_disable_conf_early_exit: bool = False,
+        eval_min_slots: int = 0,
         tstar_p_full_scale: float = 1.0,
         reward_cls_acc_weight: float = 0.0,
         reward_cls_ce_bonus: float = 0.0,
         grpo_class_teacher_kl: float = 0.0,
         grpo_class_teacher_temp: float = 1.0,
+        reward_rule_weight: float = 1.0,
+        reward_rank_weight: float = 0.0,
+        reward_area_ptrue_weight: float = 0.0,
+        kl_step_ramp: bool = True,
+        lclass_step_ramp: bool = False,
     ) -> None:
         self.num_slots = num_slots
         self.tau = tau
@@ -161,6 +176,7 @@ class SelectorConfig:
         self.force_full_rollout = force_full_rollout
         self.global_init = global_init
         self.area_weight = area_weight
+        self.area_decay_alpha = area_decay_alpha
         self.success_reward = success_reward
         self.fail_penalty = fail_penalty
         self.grpo_group_size = grpo_group_size
@@ -172,11 +188,17 @@ class SelectorConfig:
         self.imitation_alpha_class = imitation_alpha_class
         self.eval_require_tau_to_stop = eval_require_tau_to_stop
         self.eval_disable_conf_early_exit = eval_disable_conf_early_exit
+        self.eval_min_slots = eval_min_slots
         self.tstar_p_full_scale = tstar_p_full_scale
         self.reward_cls_acc_weight = reward_cls_acc_weight
         self.reward_cls_ce_bonus = reward_cls_ce_bonus
         self.grpo_class_teacher_kl = grpo_class_teacher_kl
         self.grpo_class_teacher_temp = grpo_class_teacher_temp
+        self.reward_rule_weight = reward_rule_weight
+        self.reward_rank_weight = reward_rank_weight
+        self.reward_area_ptrue_weight = reward_area_ptrue_weight
+        self.kl_step_ramp = kl_step_ramp
+        self.lclass_step_ramp = lclass_step_ramp
 
 
 def train_class_head_prewarm_epoch(
@@ -218,6 +240,7 @@ def train_class_head_prewarm_epoch(
             for bi in range(bsz):
                 s = slots[bi : bi + 1]
                 gt_bi = gt_labels[bi : bi + 1]
+                slot_embeds_s = policy.precompute_slot_embeds(s)  # [1, K, embed_dim]
                 for _ in range(masks_per_image):
                     kk = int(torch.randint(1, k + 1, (1,), device=device).item())
                     perm = torch.randperm(k, device=device)[:kk]
@@ -226,10 +249,12 @@ def train_class_head_prewarm_epoch(
                         if cfg.global_init
                         else policy.init_hidden(1, device)
                     )
+                    sel_mask = torch.zeros(1, k, device=device, dtype=torch.bool)
                     for j in range(kk):
                         pj = int(perm[j].item())
                         h = policy.step_hidden(s[:, pj], h)
-                    logits = policy.class_head(h)
+                        sel_mask[0, pj] = True
+                    logits, _ = policy.class_head(h, slot_embeds_s, sel_mask)
                     total_loss = total_loss + F.cross_entropy(logits, gt_bi)
                     n_terms += 1
 
@@ -380,6 +405,7 @@ def train_imitation_epoch(
 
         bsz, k, d = slots.shape
         h = policy.init_hidden_from_slots(slots) if cfg.global_init else policy.init_hidden(bsz, device)
+        slot_embeds = policy.precompute_slot_embeds(slots)  # [B, K, embed_dim]
         selected_mask = torch.zeros(bsz, k, device=device, dtype=torch.bool)
         max_len = targets.size(1)
         total_loss = torch.zeros((), device=device)
@@ -406,7 +432,7 @@ def train_imitation_epoch(
                 selected_mask = selected_mask | upd
 
                 if cfg.imitation_alpha_class > 0:
-                    cls_logits = policy.class_head(h)
+                    cls_logits, _ = policy.class_head(h, slot_embeds, selected_mask)
                     cls_loss = F.cross_entropy(cls_logits[idx], gt_labels[idx], reduction="mean")
                     total_loss = total_loss + cfg.imitation_alpha_class * cls_loss
                     cls_accum = cls_accum + cls_loss.detach()
@@ -452,6 +478,7 @@ def _run_full_order_rollout(
     bsz, k, d = slots.shape
     device = slots.device
     h = policy.init_hidden_from_slots(slots) if cfg.global_init else policy.init_hidden(bsz, device)
+    slot_embeds = policy.precompute_slot_embeds(slots)  # [B, K, embed_dim]
     selected_mask = torch.zeros(bsz, k, device=device, dtype=torch.bool)
     done = torch.zeros(bsz, device=device, dtype=torch.bool)
     h_dim = h.size(-1)
@@ -468,14 +495,17 @@ def _run_full_order_rollout(
     episode_len = torch.zeros(bsz, device=device)
 
     class_kl_steps: list[torch.Tensor] = []
+    p_true_steps: list[torch.Tensor] = []
 
     t_star = torch.full((bsz,), k, device=device, dtype=torch.long)
     t_star_found = torch.zeros(bsz, device=device, dtype=torch.bool)
-    if p_full is not None:
-        threshold = (p_full.to(device) * cfg.tstar_p_full_scale).clamp(min=0.05, max=1.0)
-    else:
-        threshold = torch.full((bsz,), cfg.tau, device=device)
+    threshold = torch.full((bsz,), cfg.tau, device=device)
     b_range = torch.arange(bsz, device=device)
+
+    # Constant across steps — compute once
+    _step_target = gt_labels if gt_labels is not None else y_hat_full
+    with torch.no_grad():
+        teacher_logits = clf(slots, None) if (cfg.grpo_class_teacher_kl > 0 and clf is not None) else None
 
     for step in range(k):
         active = ~done
@@ -524,35 +554,43 @@ def _run_full_order_rollout(
         upd[b_idx, actions[b_idx]] = True
         selected_mask = selected_mask | upd
 
-        cls_logits = policy.class_head(h)
+        cls_logits, _ = policy.class_head(h, slot_embeds, selected_mask)
         cls_logits_steps.append(cls_logits)
         cls_valid_steps.append(active.float())
 
         with torch.no_grad():
-            if clf is not None:
-                prefix_logits = clf(slots, selected_mask.float())
-                prefix_conf = F.softmax(prefix_logits, dim=-1)[b_range, y_hat_full]
-            else:
-                prefix_logits = None
-                prefix_conf = cls_logits.softmax(-1).max(-1).values
+            prefix_conf = cls_logits.detach().softmax(-1).max(-1).values
         prefix_conf_steps.append(prefix_conf)
 
-        if train and cfg.grpo_class_teacher_kl > 0 and prefix_logits is not None:
+        # p_true: probability assigned to GT class at this step (for R_area_ptrue)
+        p_true_step = cls_logits.detach().softmax(-1)[b_range, _step_target]
+        p_true_steps.append(torch.where(active, p_true_step, torch.zeros_like(p_true_step)))
+
+        # Per-step KL ramped by step/K: near-zero early, full weight at last step
+        # teacher_logits = DeepSets(all slots) — precomputed once outside loop
+        if cfg.grpo_class_teacher_kl > 0 and teacher_logits is not None:
+            ramp = (step + 1) / float(k) if cfg.kl_step_ramp else 1.0
             T = cfg.grpo_class_teacher_temp
             with torch.no_grad():
-                t_lp = F.log_softmax(prefix_logits / T, dim=-1)
+                t_lp = F.log_softmax(teacher_logits / T, dim=-1)
                 t_p = t_lp.exp()
             s_lp = F.log_softmax(cls_logits / T, dim=-1)
             kl_cls = (t_p * (t_lp - s_lp)).sum(dim=-1)
-            class_kl_steps.append(torch.where(active, kl_cls, torch.zeros_like(kl_cls)))
+            class_kl_steps.append(ramp * torch.where(active, kl_cls, torch.zeros_like(kl_cls)))
 
-        just_reached = active & ~t_star_found & (prefix_conf >= threshold)
-        t_star[just_reached] = step + 1
-        t_star_found = t_star_found | just_reached
+        # t*: first step where class_head is GT-correct AND pmax >= tau
+        pred_step = cls_logits.detach().argmax(-1)
+        just_reached = (active & ~t_star_found & (prefix_conf >= threshold)
+                        & (pred_step == _step_target))
+        if just_reached.any():
+            t_star[just_reached] = step + 1
+            t_star_found = t_star_found | just_reached
 
+        # Eval-only early exit: require minimum slots before stopping
         should_stop = torch.zeros(bsz, device=device, dtype=torch.bool)
         if (not train) and (not cfg.eval_disable_conf_early_exit):
-            should_stop = cls_logits.softmax(-1).max(-1).values >= cfg.tau
+            if step + 1 >= cfg.eval_min_slots:
+                should_stop = cls_logits.softmax(-1).max(-1).values >= cfg.tau
         if should_stop.any():
             si = (active & should_stop).nonzero(as_tuple=True)[0]
             h_final[si] = h[si]
@@ -562,7 +600,9 @@ def _run_full_order_rollout(
     still = ~done
     if still.any():
         h_final[still] = h[still]
-        cls_logits_final[still] = policy.class_head(h[still])
+        cls_logits_final[still], _ = policy.class_head(
+            h[still], None, selected_mask[still]
+        )
 
     log_st = torch.stack(log_probs_steps, dim=0)
     kl_st = torch.stack(kl_steps, dim=0)
@@ -570,19 +610,36 @@ def _run_full_order_rollout(
     per_traj_logp = (log_st * val_st).sum(dim=0)
     kl_mean = (kl_st * val_st).sum() / val_st.sum().clamp(min=1.0)
 
-    prefix_conf_stack = torch.stack(prefix_conf_steps, dim=0)
-    prefix_valid = torch.stack(valid_steps, dim=0)
-    area = (prefix_conf_stack * prefix_valid).sum(dim=0) / prefix_valid.sum(dim=0).clamp(min=1.0)
-    R_tstar = 1.0 - (t_star.float() / float(k))
-    R = R_tstar + cfg.area_weight * area
+    prefix_conf_stack = torch.stack(prefix_conf_steps, dim=0)  # [T, B]
+    prefix_valid = torch.stack(valid_steps, dim=0)              # [T, B]
 
-    if cfg.reward_cls_acc_weight > 0 or cfg.reward_cls_ce_bonus > 0:
-        pred = cls_logits_final.argmax(dim=-1)
-        if cfg.reward_cls_acc_weight > 0:
-            R = R + cfg.reward_cls_acc_weight * (pred == y_hat_full).float()
-        if cfg.reward_cls_ce_bonus > 0:
-            ce_f = F.cross_entropy(cls_logits_final, y_hat_full, reduction="none")
-            R = R + cfg.reward_cls_ce_bonus * (1.0 - ce_f.clamp(0.0, 2.0)).detach()
+    # pmax area (kept for logging; not used in reward)
+    area = (prefix_conf_stack * prefix_valid).sum(dim=0) / prefix_valid.sum(dim=0).clamp(min=1.0)
+
+    _reward_target = gt_labels if gt_labels is not None else y_hat_full
+
+    # R_rule: binary GT correctness at final step — primary correctness gate
+    pred_final_r = cls_logits_final.argmax(dim=-1)
+    R_rule = (pred_final_r == _reward_target).float()
+
+    # R_rank: NDCG position reward — t* = first step GT-correct AND pmax >= tau
+    dcg_w = 1.0 / torch.log2(
+        torch.arange(1, k + 1, device=device, dtype=torch.float) + 1.0
+    )  # [K]: position 0 → 1.0, position k-1 → small
+    dcg_w = dcg_w / dcg_w.sum()
+    R_rank = torch.where(
+        t_star_found,
+        dcg_w[(t_star - 1).clamp(min=0, max=k - 1)],
+        torch.zeros(bsz, device=device),
+    )
+
+    # R_area_ptrue: mean probability assigned to GT class across all steps
+    p_true_stack = torch.stack(p_true_steps, dim=0)  # [T, B]
+    R_area_ptrue = (p_true_stack * prefix_valid).sum(dim=0) / prefix_valid.sum(dim=0).clamp(min=1e-6)
+
+    R = (cfg.reward_rule_weight * R_rule
+         + cfg.reward_rank_weight * R_rule * R_rank
+         + cfg.reward_area_ptrue_weight * R_area_ptrue)
 
     if class_kl_steps:
         kl_class_stack = torch.stack(class_kl_steps, dim=0)
@@ -598,7 +655,19 @@ def _run_full_order_rollout(
         _cls_target.unsqueeze(0).expand(cls_stack.size(0), bsz).reshape(-1),
         reduction="none",
     ).view(cls_stack.size(0), bsz)
-    L_class = (ce_steps * cls_valid).sum() / cls_valid.sum().clamp(min=1.0)
+    if cfg.lclass_step_ramp and cfg.area_decay_alpha > 0.0:
+        # Earlier steps get higher weight: w_t = (1-alpha)^t, t=0 is first slot
+        T_s = cls_stack.size(0)
+        step_w = torch.pow(
+            torch.tensor(1.0 - cfg.area_decay_alpha, device=device),
+            torch.arange(T_s, device=device, dtype=torch.float),
+        )
+        step_w = step_w / step_w.sum()
+        L_class = (ce_steps * cls_valid * step_w.unsqueeze(1)).sum() / (
+            cls_valid * step_w.unsqueeze(1)
+        ).sum().clamp(min=1e-6)
+    else:
+        L_class = (ce_steps * cls_valid).sum() / cls_valid.sum().clamp(min=1.0)
 
     p_conf = cls_logits_final.softmax(-1).max(-1).values
     return {
@@ -616,6 +685,9 @@ def _run_full_order_rollout(
         "t_star": t_star,
         "t_star_found": t_star_found,
         "prefix_conf_area": area,
+        "R_rule": R_rule,
+        "R_rank": R_rank,
+        "R_area_ptrue": R_area_ptrue,
         "kl_class_mean": kl_class_mean,
     }
 
@@ -647,6 +719,7 @@ def run_grpo_rollout(
     bsz, k, d = slots.shape
     device = slots.device
     h = policy.init_hidden_from_slots(slots) if cfg.global_init else policy.init_hidden(bsz, device)
+    slot_embeds = policy.precompute_slot_embeds(slots)  # [B, K, embed_dim]
     selected_mask = torch.zeros(bsz, k, device=device, dtype=torch.bool)
     done = torch.zeros(bsz, device=device, dtype=torch.bool)
     h_dim = h.size(-1)
@@ -681,7 +754,7 @@ def run_grpo_rollout(
             )
 
         if not train and cfg.eval_require_tau_to_stop:
-            cls_chk = policy.class_head(h)
+            cls_chk, _ = policy.class_head(h, slot_embeds, selected_mask)
             pmax_chk = cls_chk.softmax(-1).max(-1).values
             slots_left = (~selected_mask).any(dim=1)
             mask_stop = active & slots_left & (pmax_chk < cfg.tau)
@@ -716,7 +789,9 @@ def run_grpo_rollout(
         if is_stop.any():
             idx = is_stop.nonzero(as_tuple=True)[0]
             h_final[idx] = h[idx]
-            cls_logits_final[idx] = policy.class_head(h[idx])
+            cls_logits_final[idx], _ = policy.class_head(
+                h[idx], None, selected_mask[idx]
+            )
             stopped_with_stop[idx] = True
             done[idx] = True
 
@@ -731,7 +806,7 @@ def run_grpo_rollout(
             upd[b_idx, pick[b_idx]] = True
             selected_mask = selected_mask | upd
 
-            cls_slot = policy.class_head(h)
+            cls_slot, _ = policy.class_head(h, slot_embeds, selected_mask)
             if not train and not cfg.eval_disable_conf_early_exit:
                 pmax = cls_slot.softmax(-1).max(-1).values
                 safety = slot_pick & ~done & (pmax >= cfg.tau)
@@ -745,10 +820,13 @@ def run_grpo_rollout(
     if still.any():
         timed_out[still] = True
         h_final[still] = h[still]
-        cls_logits_final[still] = policy.class_head(h[still])
+        cls_logits_final[still], _ = policy.class_head(
+            h[still], None, selected_mask[still]
+        )
 
     subset_norm = selected_mask.float().sum(dim=-1) / float(cfg.num_slots)
-    ce = F.cross_entropy(cls_logits_final, y_hat_full, reduction="none")
+    _reward_target = gt_labels if gt_labels is not None else y_hat_full
+    ce = F.cross_entropy(cls_logits_final, _reward_target, reduction="none")
     p_conf = cls_logits_final.softmax(-1).max(-1).values
 
     R = -ce - cfg.lambda_len * subset_norm
@@ -811,6 +889,7 @@ def train_grpo_epoch(
         "L_class": 0.0,
         "mean_R": 0.0,
         "success_rate": 0.0,
+        "gt_acc": 0.0,
         "avg_subset_size": 0.0,
         "avg_final_p": 0.0,
         "avg_t_star": 0.0,
@@ -885,7 +964,14 @@ def train_grpo_epoch(
         optimiser.step()
 
         with torch.no_grad():
-            succ = out["p_conf"] >= cfg.tau
+            # For force_full_rollout: success = teacher threshold reached (t_star found).
+            # For standard rollout: success = class_head confident at stopping point.
+            if "t_star_found" in out:
+                succ = out["t_star_found"]
+            else:
+                succ = out["p_conf"] >= cfg.tau
+            # GT accuracy of the final class_head prediction
+            gt_acc = (out["cls_logits_final"].argmax(-1) == gt_labels_e).float().mean()
             k_avg = out["selected_mask"].float().sum(-1).mean()
 
         meter["loss"] += float(loss.item()) * bsz
@@ -893,6 +979,7 @@ def train_grpo_epoch(
         meter["L_class"] += float(L_class.item()) * bsz
         meter["mean_R"] += float(R.mean().item()) * bsz
         meter["success_rate"] += float(succ.float().mean().item()) * bsz
+        meter["gt_acc"] += float(gt_acc.item()) * bsz
         meter["avg_subset_size"] += float(k_avg.item()) * bsz
         meter["avg_final_p"] += float(out["p_conf"].mean().item()) * bsz
         if "t_star" in out:
@@ -954,6 +1041,7 @@ def eval_rnn_selector(
     total = 0
     acc = {
         "success_rate": 0.0,
+        "gt_acc": 0.0,
         "avg_subset_size": 0.0,
         "avg_final_p": 0.0,
         "mean_R": 0.0,
@@ -982,6 +1070,7 @@ def eval_rnn_selector(
                 train=False,
                 clf=clf,
                 p_full=p_full,
+                gt_labels=labels,
             )
         else:
             out = run_grpo_rollout(policy, ref_policy, slots, labels, cfg, train=False)
@@ -990,7 +1079,15 @@ def eval_rnn_selector(
         R = -ce - cfg.lambda_len * subset_norm
 
         b = images.size(0)
-        acc["success_rate"] += float((out["p_conf"] >= cfg.tau).float().mean().item()) * b
+        # For force_full_rollout: success = teacher threshold found at some prefix step
+        if "t_star_found" in out:
+            succ_rate = out["t_star_found"].float().mean().item()
+        else:
+            succ_rate = (out["p_conf"] >= cfg.tau).float().mean().item()
+        gt_correct = (out["cls_logits_final"].argmax(-1) == labels).float().mean().item()
+
+        acc["success_rate"] += float(succ_rate) * b
+        acc["gt_acc"] += float(gt_correct) * b
         acc["avg_subset_size"] += float(out["selected_mask"].float().sum(-1).mean().item()) * b
         acc["avg_final_p"] += float(out["p_conf"].mean().item()) * b
         acc["mean_R"] += float(R.mean().item()) * b

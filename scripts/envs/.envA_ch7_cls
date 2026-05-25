@@ -1,12 +1,12 @@
 # CLEVR-Hans7 — EnhancedDeepSetsClassifier training config
 # Use with: python scripts/run_train_classifier.py --env_path scripts/envs/.envA_ch7_cls
-#           --sa_checkpoint D:\ocean\out\sa\999_ckpt.pt --enhanced
+#           --sa_checkpoint ./out/sa_ch7_64_3/checkpoints/sa/ --enhanced
 
 DEBUG=False
 DEVICE=cuda
 
 DATASET=ch
-DATASET_PATH=D:\ocean\scripts\datasets\CLEVR-Hans7
+DATASET_PATH=/vol/biomedic3/kw1025/ocean/scripts/datasets/CLEVR-Hans7
 DATASET_MAX_NUM_OBJ=10
 DATASET_IMAGE_RESOLUTION=64
 DATASET_CACHE=False
@@ -14,7 +14,7 @@ DATASET_BATCH_SIZE=64
 DATASET_EVAL_BATCH_SIZE=64
 LABELS=[0,1,2,3,4,5,6]
 
-# SA architecture — must match the checkpoint at D:\ocean\out\sa\999_ckpt.pt
+# SA architecture — must match the checkpoint at ./out/sa_ch7_64_3/checkpoints/sa/
 SA_WIDTH=64
 SA_NUM_SLOTS=11
 SA_SLOT_DIM=64

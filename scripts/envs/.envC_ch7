@@ -4,7 +4,7 @@ DEVICE=cuda
 
 # Dataset
 DATASET=ch
-DATASET_PATH=D:\ocean\scripts\datasets\CLEVR-Hans7
+DATASET_PATH=/vol/biomedic3/kw1025/ocean/scripts/datasets/CLEVR-Hans7
 DATASET_MAX_NUM_OBJ=10
 DATASET_IMAGE_RESOLUTION=128
 DATASET_CACHE=False
