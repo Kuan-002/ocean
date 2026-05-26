@@ -90,15 +90,32 @@ class SlotCrossAttentionClassHead(nn.Module):
 
 class SlotSelectionPolicyGRU(nn.Module):
     """
-    Inductive sequential subset policy:
-    - GRU hidden state summarizes selected slots (drives action selection).
-    - action_head: logits over K slots, optionally plus STOP (index K).
-    - class_head: linear(hidden_dim → num_classes), slot-order-independent.
+    Inductive sequential subset policy with Recurrent Evidence GRU.
+
+    Architecture (per step t)
+    ─────────────────────────
+      x_t         = encode(slot_t)                  SlotEncoder (input_proj)
+      h_t         = GRU(x_t, h_{t-1})               main GRU hidden state
+      delta_t     = h_t - h_{t-1}                   change in hidden state
+      e_t         = EvidenceMLP([delta_t, x_t])      per-step evidence signal
+      E_t         = EvidenceGRU(e_t, E_{t-1})        accumulated evidence state
+      policy_t    = PolicyHead(h_t)                  slot-selection logits [K]
+      stop_t      = StopHead(h_t)                    stop logit [1]
+      class_logits= Classifier(E_t)                  classification from evidence
+
+    Initialisation: h_0 = 0,  E_0 = 0  (always zero — no warm-start from slots).
 
     Usage
     ─────
-    slot_embeds = policy.precompute_slot_embeds(slots)  # returns None (unused)
-    logits, _ = policy.class_head(h, slot_embeds, selected_mask)
+    h = policy.init_hidden(bsz, device)
+    E = policy.init_evidence(bsz, device)
+    for each step:
+        h_new, x = policy.step_hidden(slot, h)
+        h = where(active, h_new, h)
+        delta = h - h_prev
+        E_new = policy.step_evidence(delta, x, E)
+        E = where(active, E_new, E)
+        logits, _ = policy.class_head(h, None, mask, E=E)
     """
 
     def __init__(
@@ -109,66 +126,127 @@ class SlotSelectionPolicyGRU(nn.Module):
         num_slots: int,
         num_classes: int,
         use_stop_action: bool = True,
-        class_head_num_heads: int = 4,
-        class_head_dropout: float = 0.1,
+        class_head_num_heads: int = 4,   # kept for API compat, unused
+        class_head_dropout: float = 0.1, # kept for API compat, unused
     ):
         super().__init__()
         self.num_slots = num_slots
         self.use_stop_action = use_stop_action
         self.stop_idx = num_slots
         self.num_classes = num_classes
+        self.hidden_dim = hidden_dim
+        self.embed_dim = embed_dim
+
+        # x_t = encode(slot_t)
         self.input_proj = nn.Sequential(
             nn.Linear(slot_dim, embed_dim),
             nn.ReLU(),
             nn.Linear(embed_dim, embed_dim),
         )
+
+        # h_t = GRU(x_t, h_{t-1})
         self.gru = nn.GRUCell(embed_dim, hidden_dim)
-        self.action_head = nn.Linear(hidden_dim, num_slots + int(use_stop_action))
-        # Simple linear classifier on GRU hidden state.  The cross-attention
-        # variant (SlotCrossAttentionClassHead) was tried but made classification
-        # too easy at GRPO start, collapsing the advantage signal.
-        self._class_fc = nn.Linear(hidden_dim, num_classes)
-        # Learnable projection for h0 init: allows embed_dim != hidden_dim
-        self.h0_proj = (
-            nn.Linear(embed_dim, hidden_dim, bias=False)
-            if embed_dim != hidden_dim
-            else nn.Identity()
+
+        # e_t = EvidenceMLP([delta_t, x_t])
+        self._evidence_mlp = nn.Sequential(
+            nn.Linear(hidden_dim + embed_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
         )
 
-    # Unified call interface: (h, slot_embeds, selected_mask) → (logits, None).
-    # slot_embeds and selected_mask are accepted but ignored by the linear head,
-    # keeping all callers in rnn_selector_training.py unchanged.
+        # E_t = EvidenceGRU(e_t, E_{t-1})
+        self._evidence_gru = nn.GRUCell(hidden_dim, hidden_dim)
+
+        # policy_t = PolicyHead(h_t)
+        self._policy_head = nn.Linear(hidden_dim, num_slots)
+
+        # stop_t = StopHead(h_t)
+        self._stop_head = nn.Linear(hidden_dim, 1) if use_stop_action else None
+
+        # class_logits = Classifier(E_t)
+        self._class_fc = nn.Linear(hidden_dim, num_classes)
+
+    # ── initialisation ────────────────────────────────────────────────────────
+
+    def init_hidden(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        """Zero-initialised main GRU state [B, hidden_dim]."""
+        return torch.zeros(batch_size, self.hidden_dim, device=device)
+
+    def init_evidence(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        """Zero-initialised evidence GRU state [B, hidden_dim]."""
+        return torch.zeros(batch_size, self.hidden_dim, device=device)
+
+    # ── per-step computations ─────────────────────────────────────────────────
+
+    def step_hidden(
+        self, selected_slots: torch.Tensor, hidden: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run one step of the main GRU.
+
+        Args:
+            selected_slots: [B, slot_dim]
+            hidden:         [B, hidden_dim]  h_{t-1}
+        Returns:
+            h_new: [B, hidden_dim]  h_t
+            x:     [B, embed_dim]   x_t = encode(slot_t)  (needed for EvidenceMLP)
+        """
+        x = self.input_proj(selected_slots)   # x_t
+        h_new = self.gru(x, hidden)            # h_t
+        return h_new, x
+
+    def init_slot_cache(self, batch_size: int, device: torch.device):
+        """No-op: base Evidence GRU does not use a slot cache. Returns None."""
+        return None
+
+    def update_slot_cache(self, slot_cache, x: torch.Tensor, active: torch.Tensor):
+        """No-op: base Evidence GRU does not use a slot cache. Returns None."""
+        return None
+
+    def step_evidence(
+        self,
+        delta: torch.Tensor,
+        x: torch.Tensor,
+        E_prev: torch.Tensor,
+        slot_cache=None,
+    ) -> torch.Tensor:
+        """Run one step of the Evidence GRU.
+
+        Args:
+            delta:      [B, hidden_dim]  delta_t = h_t - h_{t-1}
+            x:          [B, embed_dim]   x_t     = encode(slot_t)
+            E_prev:     [B, hidden_dim]  E_{t-1}
+            slot_cache: ignored in the base class (accepted for API compat with
+                        SlotSelectionPolicyGRUAttn which uses a cross-attention cache)
+        Returns:
+            E_new:  [B, hidden_dim]  E_t = EvidenceGRU(EvidenceMLP([delta, x]), E_{t-1})
+        """
+        e = self._evidence_mlp(torch.cat([delta, x], dim=-1))  # e_t
+        return self._evidence_gru(e, E_prev)                    # E_t
+
+    # ── heads ─────────────────────────────────────────────────────────────────
+
+    def forward_logits(self, hidden: torch.Tensor) -> torch.Tensor:
+        """policy_t ∥ stop_t  →  [B, K] or [B, K+1]."""
+        policy_logits = self._policy_head(hidden)             # [B, K]
+        if self.use_stop_action and self._stop_head is not None:
+            stop_logit = self._stop_head(hidden)              # [B, 1]
+            return torch.cat([policy_logits, stop_logit], dim=-1)  # [B, K+1]
+        return policy_logits
+
     def class_head(
         self,
         h: torch.Tensor,
-        slot_embeds,
-        selected_mask,
+        slot_embeds,          # accepted but unused (API compat)
+        selected_mask,        # accepted but unused (API compat)
+        E: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, None]:
-        return self._class_fc(h), None
+        """class_logits = Classifier(E_t).  Falls back to h when E is None."""
+        context = E if E is not None else h
+        return self._class_fc(context), None
 
     def precompute_slot_embeds(self, slots: torch.Tensor) -> None:
-        """No-op: linear class_head does not use slot embeddings."""
+        """No-op: Classifier does not use slot embeddings directly."""
         return None
-
-    def init_hidden(self, batch_size: int, device: torch.device) -> torch.Tensor:
-        return torch.zeros(batch_size, self.gru.hidden_size, device=device)
-
-    def init_hidden_from_slots(self, slots: torch.Tensor) -> torch.Tensor:
-        """
-        Initialize h0 from the mean encoded slot, giving the first action global
-        image context. A learnable projection maps embed_dim → hidden_dim so
-        the two dimensions are no longer forced to be equal.
-        """
-        slot_ctx = self.input_proj(slots).mean(dim=1)  # [B, embed_dim]
-        return self.h0_proj(slot_ctx)  # [B, hidden_dim]
-
-    def forward_logits(self, hidden: torch.Tensor) -> torch.Tensor:
-        return self.action_head(hidden)
-
-    def step_hidden(self, selected_slots: torch.Tensor, hidden: torch.Tensor) -> torch.Tensor:
-        # selected_slots: [B, D]
-        x = self.input_proj(selected_slots)
-        return self.gru(x, hidden)
 
     def apply_action_mask(self, logits: torch.Tensor, selected_mask: torch.Tensor) -> torch.Tensor:
         """

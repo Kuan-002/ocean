@@ -1,10 +1,11 @@
 """
-Sequential slot selector training: §4.1 expert imitation + GRPO (frozen SA & DeepSets).
+Sequential slot selector training: GRPO only (frozen SA & DeepSets).
 
-Training rollouts never use confidence-based early exit (only STOP or max_steps).
-Eval may use p>=tau early exit unless eval_disable_conf_early_exit is True.
-When force_full_rollout is enabled, train rollouts select every slot exactly once
-and reward early prefixes that reach the frozen DeepSets full-set confidence.
+Classification uses the Recurrent Evidence Head:
+  E_t = E_{t-1} + sigmoid(gate(h_t)) * MLP(h_t)
+  logits = Linear(E_T)
+
+Imitation pre-training and class-head prewarm have been removed.
 """
 
 from __future__ import annotations
@@ -29,10 +30,18 @@ def run_rnn_inference_batch(
     """RNN-only inference for a batch. No DeepSets in the forward path."""
     bsz, k, d = slots.shape
     device = slots.device
-    h = policy.init_hidden_from_slots(slots) if global_init else policy.init_hidden(bsz, device)
+    # global_init for legacy checkpoints: h0 = mean(input_proj(slots)).
+    # New checkpoints are always trained with h0=0; never use global_init for them.
+    if global_init and getattr(policy, "_legacy_global_init", False):
+        with torch.no_grad():
+            h = policy.input_proj(slots).mean(dim=1)   # [B, hidden_dim]
+    else:
+        h = policy.init_hidden(bsz, device)
+    E = policy.init_evidence(bsz, device)
+    slot_cache = policy.init_slot_cache(bsz, device)
     selected_mask = torch.zeros(bsz, k, device=device, dtype=torch.bool)
     done = torch.zeros(bsz, device=device, dtype=torch.bool)
-    slot_embeds = policy.precompute_slot_embeds(slots)  # [B, K, embed_dim]
+    slot_embeds = policy.precompute_slot_embeds(slots)
 
     final_pred = torch.zeros(bsz, device=device, dtype=torch.long)
     final_pmax = torch.zeros(bsz, device=device)
@@ -56,14 +65,21 @@ def run_rnn_inference_batch(
         active_idx = active.nonzero(as_tuple=True)[0]
         selected_slots = torch.zeros(bsz, d, device=device, dtype=slots.dtype)
         selected_slots[active_idx] = slots[active_idx, actions[active_idx]]
-        h_new = policy.step_hidden(selected_slots, h)
+        h_prev = h
+        h_new, x = policy.step_hidden(selected_slots, h)
         h = torch.where(active.unsqueeze(-1), h_new, h)
+        delta = h - h_prev
 
         upd = torch.zeros_like(selected_mask)
         upd[active_idx, actions[active_idx]] = True
         selected_mask = selected_mask | upd
 
-        cls_logits, _ = policy.class_head(h, slot_embeds, selected_mask)
+        # E_t = EvidenceGRU(EvidenceMLP([delta_t, x_t]), E_{t-1}), active items only
+        slot_cache = policy.update_slot_cache(slot_cache, x, active)
+        E_new = policy.step_evidence(delta, x, E, slot_cache=slot_cache)
+        E = torch.where(active.unsqueeze(-1), E_new, E)
+
+        cls_logits, _ = policy.class_head(h, slot_embeds, selected_mask, E=E)
         probs = F.softmax(cls_logits, dim=-1)
         pred = cls_logits.argmax(dim=-1)
         pmax = probs.max(dim=-1).values
@@ -80,7 +96,7 @@ def run_rnn_inference_batch(
 
     still = ~done
     if still.any():
-        cls_logits, _ = policy.class_head(h, slot_embeds, selected_mask)
+        cls_logits, _ = policy.class_head(h, slot_embeds, selected_mask, E=E)
         probs = F.softmax(cls_logits, dim=-1)
         final_pred[still] = cls_logits.argmax(dim=-1)[still]
         final_pmax[still] = probs.max(dim=-1).values[still]
@@ -97,7 +113,7 @@ def run_rnn_inference_batch(
 
 
 class SelectorConfig:
-    """Runtime config for expert, imitation, GRPO, and eval."""
+    """Runtime config for GRPO and eval."""
 
     __slots__ = (
         "num_slots",
@@ -117,7 +133,6 @@ class SelectorConfig:
         "alpha_class",
         "max_grad_norm",
         "grpo_adv_clip",
-        "imitation_alpha_class",
         "eval_require_tau_to_stop",
         "eval_disable_conf_early_exit",
         "eval_min_slots",
@@ -153,7 +168,6 @@ class SelectorConfig:
         area_decay_alpha: float = 0.0,
         max_grad_norm: float = 1.0,
         grpo_adv_clip: float = 10.0,
-        imitation_alpha_class: float = 2.0,
         eval_require_tau_to_stop: bool = False,
         eval_disable_conf_early_exit: bool = False,
         eval_min_slots: int = 0,
@@ -185,7 +199,6 @@ class SelectorConfig:
         self.alpha_class = alpha_class
         self.max_grad_norm = max_grad_norm
         self.grpo_adv_clip = grpo_adv_clip
-        self.imitation_alpha_class = imitation_alpha_class
         self.eval_require_tau_to_stop = eval_require_tau_to_stop
         self.eval_disable_conf_early_exit = eval_disable_conf_early_exit
         self.eval_min_slots = eval_min_slots
@@ -199,264 +212,6 @@ class SelectorConfig:
         self.reward_area_ptrue_weight = reward_area_ptrue_weight
         self.kl_step_ramp = kl_step_ramp
         self.lclass_step_ramp = lclass_step_ramp
-
-
-def train_class_head_prewarm_epoch(
-    sa,
-    clf: DeepSetsClassifier,
-    policy: SlotSelectionPolicyGRU,
-    loader,
-    optimiser: torch.optim.Optimizer,
-    device: torch.device,
-    cfg: SelectorConfig,
-    masks_per_image: int,
-    slot_opts: dict | None = None,
-) -> dict:
-    """
-    Pretrain class_head (and slot embedding / GRU) on random-prefix states.
-    Teacher label = argmax DeepSets(slots, None). action_head gradients are disabled.
-    """
-    policy.train()
-    clf.eval()
-    sa.eval()
-    slot_kw = slot_opts or {}
-    k = cfg.num_slots
-    meter = {"prewarm_loss": 0.0, "n": 0}
-
-    prev_action_req: list[bool] = []
-    for p in policy.action_head.parameters():
-        prev_action_req.append(p.requires_grad)
-        p.requires_grad_(False)
-    try:
-        for images, _, gt_labels in loader:
-            images = images.to(device)
-            gt_labels = gt_labels.to(device)
-            bsz = images.size(0)
-            with torch.no_grad():
-                slots = batch_slots(sa, images, device, **slot_kw)
-
-            total_loss = torch.zeros((), device=device)
-            n_terms = 0
-            for bi in range(bsz):
-                s = slots[bi : bi + 1]
-                gt_bi = gt_labels[bi : bi + 1]
-                slot_embeds_s = policy.precompute_slot_embeds(s)  # [1, K, embed_dim]
-                for _ in range(masks_per_image):
-                    kk = int(torch.randint(1, k + 1, (1,), device=device).item())
-                    perm = torch.randperm(k, device=device)[:kk]
-                    h = (
-                        policy.init_hidden_from_slots(s)
-                        if cfg.global_init
-                        else policy.init_hidden(1, device)
-                    )
-                    sel_mask = torch.zeros(1, k, device=device, dtype=torch.bool)
-                    for j in range(kk):
-                        pj = int(perm[j].item())
-                        h = policy.step_hidden(s[:, pj], h)
-                        sel_mask[0, pj] = True
-                    logits, _ = policy.class_head(h, slot_embeds_s, sel_mask)
-                    total_loss = total_loss + F.cross_entropy(logits, gt_bi)
-                    n_terms += 1
-
-            loss = total_loss / max(n_terms, 1)
-            optimiser.zero_grad(set_to_none=True)
-            loss.backward()
-            if cfg.max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(policy.parameters(), cfg.max_grad_norm)
-            optimiser.step()
-
-            meter["prewarm_loss"] += float(loss.detach().item()) * bsz
-            meter["n"] += bsz
-    finally:
-        for p, was in zip(policy.action_head.parameters(), prev_action_req):
-            p.requires_grad_(was)
-
-    n = max(meter["n"], 1)
-    return {"prewarm_loss": meter["prewarm_loss"] / n}
-
-
-@torch.no_grad()
-def build_expert_batch(
-    clf: DeepSetsClassifier,
-    slots: torch.Tensor,
-    y_hat_full: torch.Tensor,
-    p_full: torch.Tensor,
-    stop_idx: int,
-    cfg: SelectorConfig,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Greedy expert by marginal gain (masked DeepSets); vectorized over batch."""
-    bsz, k, _ = slots.shape
-    device = slots.device
-    dtype = slots.dtype
-
-    if cfg.force_full_rollout:
-        selected = torch.zeros(bsz, k, device=device, dtype=dtype)
-        sequences: list[list[int]] = [[] for _ in range(bsz)]
-        b_range = torch.arange(bsz, device=device)
-
-        for _ in range(k):
-            logits_s = clf(slots, selected)
-            p_s = F.softmax(logits_s, dim=-1)[b_range, y_hat_full]
-            b_idx = b_range.unsqueeze(1).expand(bsz, k).reshape(bsz * k)
-            j_idx = torch.arange(k, device=device).unsqueeze(0).expand(bsz, k).reshape(bsz * k)
-            slot_stacked = slots[b_idx]
-            sel2 = selected[b_idx].clone()
-            row = torch.arange(bsz * k, device=device)
-            sel2[row, j_idx] = torch.where(
-                selected[b_idx, j_idx] < 0.5,
-                torch.ones((), device=device, dtype=dtype),
-                sel2[row, j_idx],
-            )
-            logits_c = clf(slot_stacked, sel2)
-            p_cand = F.softmax(logits_c, dim=-1)[row, y_hat_full[b_idx]]
-            gain = (p_cand - p_s[b_idx]).view(bsz, k)
-            gain = gain.masked_fill(selected > 0.5, float("-inf"))
-            best_j = gain.argmax(dim=1)
-
-            for bi, act in enumerate(best_j.tolist()):
-                sequences[bi].append(int(act))
-            selected[b_range, best_j] = 1.0
-
-        padded = torch.tensor(sequences, device=device, dtype=torch.long)
-        mask = torch.ones(bsz, k, device=device, dtype=torch.bool)
-        return padded, mask
-
-    selected = torch.zeros(bsz, k, device=device, dtype=dtype)
-    thresh = torch.maximum(torch.full_like(p_full, cfg.tau), p_full - cfg.epsilon)
-    active = torch.ones(bsz, dtype=torch.bool, device=device)
-    sequences: list[list[int]] = [[] for _ in range(bsz)]
-
-    b_range = torch.arange(bsz, device=device)
-
-    while active.any():
-        logits_s = clf(slots, selected)
-        p_s = F.softmax(logits_s, dim=-1)[b_range, y_hat_full]
-        done_now = active & (p_s >= thresh)
-        active = active & ~done_now
-        if not active.any():
-            break
-
-        b_idx = b_range.unsqueeze(1).expand(bsz, k).reshape(bsz * k)
-        j_idx = torch.arange(k, device=device).unsqueeze(0).expand(bsz, k).reshape(bsz * k)
-        slot_stacked = slots[b_idx]
-        sel2 = selected[b_idx].clone()
-        row = torch.arange(bsz * k, device=device)
-        sel2[row, j_idx] = torch.where(
-            selected[b_idx, j_idx] < 0.5,
-            torch.ones((), device=device, dtype=dtype),
-            sel2[row, j_idx],
-        )
-        logits_c = clf(slot_stacked, sel2)
-        p_cand = F.softmax(logits_c, dim=-1)[row, y_hat_full[b_idx]]
-        gain = (p_cand - p_s[b_idx]).view(bsz, k)
-        gain = gain.masked_fill(selected > 0.5, float("-inf"))
-        gain = gain.masked_fill(~active.unsqueeze(1), float("-inf"))
-        best_j = gain.argmax(dim=1)
-
-        act_idx = active.nonzero(as_tuple=True)[0]
-        for bi in act_idx.tolist():
-            sequences[bi].append(int(best_j[bi].item()))
-        selected[active, best_j[active]] = 1.0
-        active = active & (selected < 0.5).any(dim=1)
-
-    for bi in range(bsz):
-        sequences[bi].append(stop_idx)
-
-    max_len = max(len(s) for s in sequences)
-    padded = torch.full((bsz, max_len), stop_idx, device=device, dtype=torch.long)
-    mask = torch.zeros(bsz, max_len, device=device, dtype=torch.bool)
-    for bi, s in enumerate(sequences):
-        L = len(s)
-        padded[bi, :L] = torch.tensor(s, device=device, dtype=torch.long)
-        mask[bi, :L] = True
-    return padded, mask
-
-
-def train_imitation_epoch(
-    sa,
-    clf: DeepSetsClassifier,
-    policy: SlotSelectionPolicyGRU,
-    loader,
-    optimiser: torch.optim.Optimizer,
-    device: torch.device,
-    cfg: SelectorConfig,
-    slot_opts: dict | None = None,
-) -> dict:
-    """
-    Supervise action_head on expert actions; supervise class_head after each slot GRU step
-    (targets = frozen clf(slots, None) argmax y_hat).
-    """
-    policy.train()
-    clf.eval()
-    sa.eval()
-    meter = {"imitation_loss": 0.0, "imitation_cls_loss": 0.0, "n": 0}
-
-    slot_kw = slot_opts or {}
-    for images, _, gt_labels in loader:
-        images = images.to(device)
-        gt_labels = gt_labels.to(device)
-        with torch.no_grad():
-            slots = batch_slots(sa, images, device, **slot_kw)
-            logits_full = clf(slots, None)
-            probs_full = F.softmax(logits_full, dim=-1)
-            y_hat = logits_full.argmax(dim=-1)
-            p_full = probs_full[torch.arange(slots.size(0), device=device), y_hat]
-            targets, targ_mask = build_expert_batch(clf, slots, y_hat, p_full, policy.stop_idx, cfg)
-
-        bsz, k, d = slots.shape
-        h = policy.init_hidden_from_slots(slots) if cfg.global_init else policy.init_hidden(bsz, device)
-        slot_embeds = policy.precompute_slot_embeds(slots)  # [B, K, embed_dim]
-        selected_mask = torch.zeros(bsz, k, device=device, dtype=torch.bool)
-        max_len = targets.size(1)
-        total_loss = torch.zeros((), device=device)
-        cls_accum = torch.zeros((), device=device)
-        cls_steps = 0
-        denom = targ_mask.float().sum().clamp(min=1.0)
-
-        for t in range(max_len):
-            logits = policy.apply_action_mask(policy.forward_logits(h), selected_mask)
-            step_ce = F.cross_entropy(logits, targets[:, t], reduction="none")
-            total_loss = total_loss + (step_ce * targ_mask[:, t].float()).sum() / denom
-
-            a = targets[:, t]
-            is_stop = a == policy.stop_idx
-            pick_slot = (~is_stop) & targ_mask[:, t]
-            if pick_slot.any():
-                ss = torch.zeros(bsz, d, device=device, dtype=slots.dtype)
-                idx = torch.arange(bsz, device=device)[pick_slot]
-                pj = a[pick_slot].clamp(max=k - 1)
-                ss[idx] = slots[idx, pj]
-                h = policy.step_hidden(ss, h)
-                upd = torch.zeros_like(selected_mask)
-                upd[idx, pj] = True
-                selected_mask = selected_mask | upd
-
-                if cfg.imitation_alpha_class > 0:
-                    cls_logits, _ = policy.class_head(h, slot_embeds, selected_mask)
-                    cls_loss = F.cross_entropy(cls_logits[idx], gt_labels[idx], reduction="mean")
-                    total_loss = total_loss + cfg.imitation_alpha_class * cls_loss
-                    cls_accum = cls_accum + cls_loss.detach()
-                    cls_steps += 1
-
-        optimiser.zero_grad(set_to_none=True)
-        total_loss.backward()
-        if cfg.max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(policy.parameters(), cfg.max_grad_norm)
-        optimiser.step()
-
-        b = images.size(0)
-        meter["imitation_loss"] += float(total_loss.detach().item()) * b
-        if cls_steps > 0:
-            meter["imitation_cls_loss"] += float((cls_accum / cls_steps).item()) * b
-        meter["n"] += b
-
-    n = max(meter["n"], 1)
-    out = {"imitation_loss": meter["imitation_loss"] / n}
-    if meter["imitation_cls_loss"] > 0:
-        out["imitation_cls_loss"] = meter["imitation_cls_loss"] / n
-    else:
-        out["imitation_cls_loss"] = 0.0
-    return out
 
 
 def _run_full_order_rollout(
@@ -477,13 +232,16 @@ def _run_full_order_rollout(
 
     bsz, k, d = slots.shape
     device = slots.device
-    h = policy.init_hidden_from_slots(slots) if cfg.global_init else policy.init_hidden(bsz, device)
-    slot_embeds = policy.precompute_slot_embeds(slots)  # [B, K, embed_dim]
+    h = policy.init_hidden(bsz, device)
+    E = policy.init_evidence(bsz, device)
+    slot_cache = policy.init_slot_cache(bsz, device)
+    slot_embeds = policy.precompute_slot_embeds(slots)
     selected_mask = torch.zeros(bsz, k, device=device, dtype=torch.bool)
     done = torch.zeros(bsz, device=device, dtype=torch.bool)
     h_dim = h.size(-1)
     num_cls = policy.num_classes
     h_final = torch.zeros(bsz, h_dim, device=device)
+    E_final = policy.init_evidence(bsz, device)
     cls_logits_final = torch.zeros(bsz, num_cls, device=device)
 
     log_probs_steps: list[torch.Tensor] = []
@@ -502,7 +260,6 @@ def _run_full_order_rollout(
     threshold = torch.full((bsz,), cfg.tau, device=device)
     b_range = torch.arange(bsz, device=device)
 
-    # Constant across steps — compute once
     _step_target = gt_labels if gt_labels is not None else y_hat_full
     with torch.no_grad():
         teacher_logits = clf(slots, None) if (cfg.grpo_class_teacher_kl > 0 and clf is not None) else None
@@ -525,7 +282,7 @@ def _run_full_order_rollout(
 
         if not torch.isfinite(logits).all():
             raise RuntimeError(
-                "Non-finite action logits in run_grpo_rollout. "
+                "Non-finite action logits in _run_full_order_rollout. "
                 "Lower RNN_SEL_LR / RNN_SEL_ALPHA_CLASS, tighten RNN_SEL_MAX_GRAD_NORM, "
                 "or raise RNN_SEL_GRPO_ADV_CLIP; use CUDA_LAUNCH_BLOCKING=1."
             )
@@ -548,13 +305,20 @@ def _run_full_order_rollout(
         ss = torch.zeros(bsz, d, device=device, dtype=slots.dtype)
         b_idx = active.nonzero(as_tuple=True)[0]
         ss[b_idx] = slots[b_idx, actions[b_idx]]
-        h_new = policy.step_hidden(ss, h)
+        h_prev = h
+        h_new, x = policy.step_hidden(ss, h)
         h = torch.where(active.unsqueeze(-1), h_new, h)
+        delta = h - h_prev
         upd = torch.zeros_like(selected_mask)
         upd[b_idx, actions[b_idx]] = True
         selected_mask = selected_mask | upd
 
-        cls_logits, _ = policy.class_head(h, slot_embeds, selected_mask)
+        # E_t = EvidenceGRU(EvidenceMLP([delta_t, x_t]), E_{t-1}), active items only
+        slot_cache = policy.update_slot_cache(slot_cache, x, active)
+        E_new = policy.step_evidence(delta, x, E, slot_cache=slot_cache)
+        E = torch.where(active.unsqueeze(-1), E_new, E)
+
+        cls_logits, _ = policy.class_head(h, slot_embeds, selected_mask, E=E)
         cls_logits_steps.append(cls_logits)
         cls_valid_steps.append(active.float())
 
@@ -562,12 +326,9 @@ def _run_full_order_rollout(
             prefix_conf = cls_logits.detach().softmax(-1).max(-1).values
         prefix_conf_steps.append(prefix_conf)
 
-        # p_true: probability assigned to GT class at this step (for R_area_ptrue)
         p_true_step = cls_logits.detach().softmax(-1)[b_range, _step_target]
         p_true_steps.append(torch.where(active, p_true_step, torch.zeros_like(p_true_step)))
 
-        # Per-step KL ramped by step/K: near-zero early, full weight at last step
-        # teacher_logits = DeepSets(all slots) — precomputed once outside loop
         if cfg.grpo_class_teacher_kl > 0 and teacher_logits is not None:
             ramp = (step + 1) / float(k) if cfg.kl_step_ramp else 1.0
             T = cfg.grpo_class_teacher_temp
@@ -578,7 +339,6 @@ def _run_full_order_rollout(
             kl_cls = (t_p * (t_lp - s_lp)).sum(dim=-1)
             class_kl_steps.append(ramp * torch.where(active, kl_cls, torch.zeros_like(kl_cls)))
 
-        # t*: first step where class_head is GT-correct AND pmax >= tau
         pred_step = cls_logits.detach().argmax(-1)
         just_reached = (active & ~t_star_found & (prefix_conf >= threshold)
                         & (pred_step == _step_target))
@@ -586,7 +346,6 @@ def _run_full_order_rollout(
             t_star[just_reached] = step + 1
             t_star_found = t_star_found | just_reached
 
-        # Eval-only early exit: require minimum slots before stopping
         should_stop = torch.zeros(bsz, device=device, dtype=torch.bool)
         if (not train) and (not cfg.eval_disable_conf_early_exit):
             if step + 1 >= cfg.eval_min_slots:
@@ -594,14 +353,16 @@ def _run_full_order_rollout(
         if should_stop.any():
             si = (active & should_stop).nonzero(as_tuple=True)[0]
             h_final[si] = h[si]
+            E_final[si] = E[si]
             cls_logits_final[si] = cls_logits[si]
             done[si] = True
 
     still = ~done
     if still.any():
         h_final[still] = h[still]
+        E_final[still] = E[still]
         cls_logits_final[still], _ = policy.class_head(
-            h[still], None, selected_mask[still]
+            h[still], None, selected_mask[still], E=E[still]
         )
 
     log_st = torch.stack(log_probs_steps, dim=0)
@@ -613,19 +374,16 @@ def _run_full_order_rollout(
     prefix_conf_stack = torch.stack(prefix_conf_steps, dim=0)  # [T, B]
     prefix_valid = torch.stack(valid_steps, dim=0)              # [T, B]
 
-    # pmax area (kept for logging; not used in reward)
     area = (prefix_conf_stack * prefix_valid).sum(dim=0) / prefix_valid.sum(dim=0).clamp(min=1.0)
 
     _reward_target = gt_labels if gt_labels is not None else y_hat_full
 
-    # R_rule: binary GT correctness at final step — primary correctness gate
     pred_final_r = cls_logits_final.argmax(dim=-1)
     R_rule = (pred_final_r == _reward_target).float()
 
-    # R_rank: NDCG position reward — t* = first step GT-correct AND pmax >= tau
     dcg_w = 1.0 / torch.log2(
         torch.arange(1, k + 1, device=device, dtype=torch.float) + 1.0
-    )  # [K]: position 0 → 1.0, position k-1 → small
+    )
     dcg_w = dcg_w / dcg_w.sum()
     R_rank = torch.where(
         t_star_found,
@@ -633,7 +391,6 @@ def _run_full_order_rollout(
         torch.zeros(bsz, device=device),
     )
 
-    # R_area_ptrue: mean probability assigned to GT class across all steps
     p_true_stack = torch.stack(p_true_steps, dim=0)  # [T, B]
     R_area_ptrue = (p_true_stack * prefix_valid).sum(dim=0) / prefix_valid.sum(dim=0).clamp(min=1e-6)
 
@@ -656,7 +413,6 @@ def _run_full_order_rollout(
         reduction="none",
     ).view(cls_stack.size(0), bsz)
     if cfg.lclass_step_ramp and cfg.area_decay_alpha > 0.0:
-        # Earlier steps get higher weight: w_t = (1-alpha)^t, t=0 is first slot
         T_s = cls_stack.size(0)
         step_w = torch.pow(
             torch.tensor(1.0 - cfg.area_decay_alpha, device=device),
@@ -718,13 +474,16 @@ def run_grpo_rollout(
 
     bsz, k, d = slots.shape
     device = slots.device
-    h = policy.init_hidden_from_slots(slots) if cfg.global_init else policy.init_hidden(bsz, device)
-    slot_embeds = policy.precompute_slot_embeds(slots)  # [B, K, embed_dim]
+    h = policy.init_hidden(bsz, device)
+    E = policy.init_evidence(bsz, device)
+    slot_cache = policy.init_slot_cache(bsz, device)
+    slot_embeds = policy.precompute_slot_embeds(slots)
     selected_mask = torch.zeros(bsz, k, device=device, dtype=torch.bool)
     done = torch.zeros(bsz, device=device, dtype=torch.bool)
     h_dim = h.size(-1)
     num_cls = policy.num_classes
     h_final = torch.zeros(bsz, h_dim, device=device)
+    E_final = policy.init_evidence(bsz, device)
     cls_logits_final = torch.zeros(bsz, num_cls, device=device)
     stopped_with_stop = torch.zeros(bsz, device=device, dtype=torch.bool)
     timed_out = torch.zeros(bsz, device=device, dtype=torch.bool)
@@ -754,7 +513,7 @@ def run_grpo_rollout(
             )
 
         if not train and cfg.eval_require_tau_to_stop:
-            cls_chk, _ = policy.class_head(h, slot_embeds, selected_mask)
+            cls_chk, _ = policy.class_head(h, slot_embeds, selected_mask, E=E)
             pmax_chk = cls_chk.softmax(-1).max(-1).values
             slots_left = (~selected_mask).any(dim=1)
             mask_stop = active & slots_left & (pmax_chk < cfg.tau)
@@ -789,8 +548,9 @@ def run_grpo_rollout(
         if is_stop.any():
             idx = is_stop.nonzero(as_tuple=True)[0]
             h_final[idx] = h[idx]
+            E_final[idx] = E[idx]          # freeze evidence at STOP (no new slot)
             cls_logits_final[idx], _ = policy.class_head(
-                h[idx], None, selected_mask[idx]
+                h[idx], None, selected_mask[idx], E=E[idx]
             )
             stopped_with_stop[idx] = True
             done[idx] = True
@@ -800,19 +560,27 @@ def run_grpo_rollout(
             ss = torch.zeros(bsz, d, device=device, dtype=slots.dtype)
             b_idx = slot_pick.nonzero(as_tuple=True)[0]
             ss[b_idx] = slots[b_idx, pick[b_idx]]
-            h_new = policy.step_hidden(ss, h)
+            h_prev = h
+            h_new, x = policy.step_hidden(ss, h)
             h = torch.where(slot_pick.unsqueeze(-1), h_new, h)
+            delta = h - h_prev
             upd = torch.zeros_like(selected_mask)
             upd[b_idx, pick[b_idx]] = True
             selected_mask = selected_mask | upd
 
-            cls_slot, _ = policy.class_head(h, slot_embeds, selected_mask)
+            # E_t = EvidenceGRU(EvidenceMLP([delta_t, x_t]), E_{t-1}), slot_pick items only
+            slot_cache = policy.update_slot_cache(slot_cache, x, slot_pick)
+            E_new = policy.step_evidence(delta, x, E, slot_cache=slot_cache)
+            E = torch.where(slot_pick.unsqueeze(-1), E_new, E)
+
+            cls_slot, _ = policy.class_head(h, slot_embeds, selected_mask, E=E)
             if not train and not cfg.eval_disable_conf_early_exit:
                 pmax = cls_slot.softmax(-1).max(-1).values
                 safety = slot_pick & ~done & (pmax >= cfg.tau)
                 if safety.any():
                     si = safety.nonzero(as_tuple=True)[0]
                     h_final[si] = h[si]
+                    E_final[si] = E[si]
                     cls_logits_final[si] = cls_slot[si]
                     done[si] = True
 
@@ -820,8 +588,9 @@ def run_grpo_rollout(
     if still.any():
         timed_out[still] = True
         h_final[still] = h[still]
+        E_final[still] = E[still]
         cls_logits_final[still], _ = policy.class_head(
-            h[still], None, selected_mask[still]
+            h[still], None, selected_mask[still], E=E[still]
         )
 
     subset_norm = selected_mask.float().sum(dim=-1) / float(cfg.num_slots)
@@ -964,13 +733,10 @@ def train_grpo_epoch(
         optimiser.step()
 
         with torch.no_grad():
-            # For force_full_rollout: success = teacher threshold reached (t_star found).
-            # For standard rollout: success = class_head confident at stopping point.
             if "t_star_found" in out:
                 succ = out["t_star_found"]
             else:
                 succ = out["p_conf"] >= cfg.tau
-            # GT accuracy of the final class_head prediction
             gt_acc = (out["cls_logits_final"].argmax(-1) == gt_labels_e).float().mean()
             k_avg = out["selected_mask"].float().sum(-1).mean()
 
@@ -1079,7 +845,6 @@ def eval_rnn_selector(
         R = -ce - cfg.lambda_len * subset_norm
 
         b = images.size(0)
-        # For force_full_rollout: success = teacher threshold found at some prefix step
         if "t_star_found" in out:
             succ_rate = out["t_star_found"].float().mean().item()
         else:

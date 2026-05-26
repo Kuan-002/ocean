@@ -58,7 +58,8 @@ def run_full_order(
         raise ValueError("visualization expects a single image")
 
     device = slots.device
-    h = policy.init_hidden_from_slots(slots) if global_init else policy.init_hidden(1, device)
+    h = policy.init_hidden(1, device)
+    E = policy.init_evidence(1, device)
     selected_mask = torch.zeros(1, k, device=device, dtype=torch.bool)
     trace: list[dict] = []
 
@@ -70,10 +71,13 @@ def run_full_order(
             logits[:, k:] = fill
 
         action = int(logits.argmax(dim=-1).item())
-        h = policy.step_hidden(slots[:, action], h)
+        h_prev = h
+        h, x = policy.step_hidden(slots[:, action], h)
+        delta = h - h_prev
+        E = policy.step_evidence(delta, x, E)
         selected_mask[0, action] = True
 
-        rnn_logits = policy.class_head(h)
+        rnn_logits, _ = policy.class_head(h, None, selected_mask, E=E)
         rnn_probs = F.softmax(rnn_logits, dim=-1)
         rnn_pred = int(rnn_logits.argmax(dim=-1).item())
         rnn_pmax = float(rnn_probs.max(dim=-1).values.item())

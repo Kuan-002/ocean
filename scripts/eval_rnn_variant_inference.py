@@ -1,5 +1,20 @@
 #!/usr/bin/env python3
-"""Evaluate deploy-time RNN-only inference and save correct/wrong path examples."""
+"""Evaluate deploy-time RNN-only inference for variant policy models.
+
+Equivalent to eval_rnn_only_inference.py but uses build_policy() to
+automatically instantiate the correct model class based on the head_type
+stored in the checkpoint meta dict.
+
+Supports:
+  "linear"    → SlotSelectionPolicyLinear
+  "crossattn" → SlotSelectionPolicyCrossAttn
+  "evidence"  → SlotSelectionPolicyGRU   (default when head_type missing)
+
+Also handles legacy checkpoints (pre-Evidence Head) via key remapping,
+matching the behaviour of eval_rnn_only_inference.py.
+
+This script does NOT modify any existing file in the repository.
+"""
 
 from __future__ import annotations
 
@@ -13,7 +28,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-# Avoid a common Windows torch/numpy/matplotlib OpenMP duplicate runtime crash.
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import matplotlib.pyplot as plt
@@ -24,19 +38,30 @@ from tqdm import tqdm
 from src.classification.training import batch_slots
 from src.clevr_hans_dataset import setup_dataloaders
 from src.config import Config
-from src.explanation.rnn_selector import SlotSelectionPolicyGRU
+from src.explanation.rnn_selector_variants import build_policy
 from src.explanation.rnn_selector_training import run_rnn_inference_batch
 from src.mds_dataset import setup_dataloaders_mds
 from src.utils import reconstruct_autoencoder, resolve_checkpoint_path, seed_all
 
 
-def load_selector(path: str, model: SlotSelectionPolicyGRU, device: torch.device) -> dict:
+# ── checkpoint loading ─────────────────────────────────────────────────────────
+
+def peek_head_type(path: str) -> str:
+    """Return the head_type stored in the checkpoint meta, defaulting to 'evidence'."""
+    try:
+        ckpt = torch.load(path, map_location="cpu", weights_only=True)
+        return ckpt.get("meta", {}).get("head_type", "evidence")
+    except Exception:
+        return "evidence"
+
+
+def load_selector(path: str, model: torch.nn.Module, device: torch.device) -> dict:
+    """Load state dict into model; handles legacy key remapping for old checkpoints."""
     ckpt = torch.load(path, map_location=device, weights_only=True)
     sd = ckpt["state_dict"]
 
     # ── backward-compat: remap old key names to new architecture ────────────
-    # Old checkpoints used "action_head" / "class_head"; new model uses
-    # "_policy_head" / "_class_fc" plus an Evidence GRU not present in old ckpts.
+    # Old checkpoints (before Evidence Head) used "action_head" / "class_head".
     _legacy_remap = {
         "action_head.weight": "_policy_head.weight",
         "action_head.bias":   "_policy_head.bias",
@@ -47,26 +72,21 @@ def load_selector(path: str, model: SlotSelectionPolicyGRU, device: torch.device
     if is_legacy:
         sd = {_legacy_remap.get(k, k): v for k, v in sd.items()}
 
-    # strict=False for legacy: evidence MLP/GRU keys are absent; they will be
-    # randomly initialised but we override class_head below so they are never used.
     model.load_state_dict(sd, strict=not is_legacy)
 
     if is_legacy:
-        # Old model classified directly from h (main GRU hidden state).
-        # Override class_head to use h instead of E so randomly-initialised
-        # evidence weights don't corrupt inference.
         import types
 
         def _class_head_legacy(self, h, slot_embeds=None, selected_mask=None, E=None):
             return self._class_fc(h), None
 
         model.class_head = types.MethodType(_class_head_legacy, model)
-        # Mark so inference functions can restore global_init behaviour.
-        # Old checkpoints were trained with h0 = input_proj(slots).mean(dim=1).
         model._legacy_global_init = True
 
     return ckpt.get("meta", {})
 
+
+# ── visualisation helpers ──────────────────────────────────────────────────────
 
 def to_uint8_image(image: torch.Tensor) -> torch.Tensor:
     return ((image.detach().cpu() * 127.5) + 127.5).clamp(0, 255).byte()
@@ -78,7 +98,7 @@ def slot_to_uint8(slot_img: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
 
 @torch.no_grad()
 def run_rnn_inference_trace(
-    policy: SlotSelectionPolicyGRU,
+    policy,
     slots: torch.Tensor,
     y_true: int,
     tau: float,
@@ -91,10 +111,9 @@ def run_rnn_inference_trace(
         raise ValueError("visualization expects a single image")
 
     device = slots.device
-    # global_init for legacy checkpoints only (new models always use h0=0).
     if global_init and getattr(policy, "_legacy_global_init", False):
         with torch.no_grad():
-            h = policy.input_proj(slots).mean(dim=1)   # [B, hidden_dim]
+            h = policy.input_proj(slots).mean(dim=1)
     else:
         h = policy.init_hidden(1, device)
     E = policy.init_evidence(1, device)
@@ -154,6 +173,7 @@ def save_trace_plot(
     split: str,
     tau: float,
     global_init: bool,
+    head_type: str,
     selector_checkpoint: str,
     meta: dict,
     out_path: str,
@@ -171,7 +191,10 @@ def save_trace_plot(
     ax0 = fig.add_subplot(gs[0, 0])
     ax0.imshow(to_uint8_image(image[0]).permute(1, 2, 0).numpy())
     stop_text = f"stop_t={stop_step}" if stop_step is not None else "no stop before K"
-    ax0.set_title(f"Original\ntrue={label}, final_pred={final_pred}\npmax={final_pmax:.3f}, {stop_text}")
+    ax0.set_title(
+        f"Original\ntrue={label}, final_pred={final_pred}\n"
+        f"pmax={final_pmax:.3f}, {stop_text}"
+    )
     ax0.axis("off")
 
     if cols > 1:
@@ -183,19 +206,17 @@ def save_trace_plot(
     if cols > 2:
         ax_text = fig.add_subplot(gs[0, 2:])
         ax_text.axis("off")
-        meta_line = f"selector={Path(selector_checkpoint).name}"
+        meta_line = f"selector={Path(selector_checkpoint).name}  head={head_type}"
         if meta.get("epoch") is not None:
-            meta_line += f", epoch={meta['epoch']}"
+            meta_line += f"  epoch={meta['epoch']}"
         ax_text.text(
-            0.0,
-            0.5,
-            f"RNN-only inference, no DeepSets loaded\n"
-            f"split={split}, sample_index={sample_index}, tau={tau:.3f}\n"
+            0.0, 0.5,
+            f"RNN-only inference  head={head_type}\n"
+            f"split={split}  sample={sample_index}  tau={tau:.3f}\n"
             f"global_init={global_init}\n"
             f"{meta_line}\n"
-            "Each slot title: step / slot / RNN prediction / confidence",
-            va="center",
-            fontsize=11,
+            "Step title: step / slot / pred / confidence",
+            va="center", fontsize=11,
         )
 
     for i, item in enumerate(trace):
@@ -226,30 +247,26 @@ def save_trace_plot(
     plt.close(fig)
 
 
+# ── main ───────────────────────────────────────────────────────────────────────
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate RNN-only inference and save examples")
+    parser = argparse.ArgumentParser(
+        description="Evaluate RNN variant inference and save trace examples"
+    )
     parser.add_argument("--env_path", type=str, default="scripts/envs/.envA_ch3_rnn")
     parser.add_argument("--sa_checkpoint", type=str, default="out/sa.pt")
     parser.add_argument("--selector_checkpoint", type=str, required=True)
-    parser.add_argument("--split", type=str, default="val", choices=["train", "val", "test"])
-    parser.add_argument("--tau", type=float, default=None, help="RNN confidence stop threshold")
+    parser.add_argument("--split", type=str, default="val",
+                        choices=["train", "val", "test"])
+    parser.add_argument("--tau", type=float, default=None)
     parser.add_argument("--max_samples", type=int, default=-1)
     parser.add_argument("--num_examples", type=int, default=10)
-    parser.add_argument(
-        "--force_full",
-        action="store_true",
-        help="Select all slots for metrics and visualizations, ignoring tau stop.",
-    )
-    parser.add_argument(
-        "--out_dir",
-        type=str,
-        default="out/rnn_selector_full_order_ch3/rnn_only_eval",
-    )
-    parser.add_argument(
-        "--no_global_init",
-        action="store_true",
-        help="Use zero h0 (ignore RNN_SEL_GLOBAL_INIT). Use for checkpoints trained before global init.",
-    )
+    parser.add_argument("--force_full", action="store_true",
+                        help="Select all slots, ignore tau stop.")
+    parser.add_argument("--out_dir", type=str,
+                        default="out/rnn_variant_eval")
+    parser.add_argument("--no_global_init", action="store_true",
+                        help="Force zero h0 regardless of RNN_SEL_GLOBAL_INIT.")
     args = parser.parse_args()
 
     config = Config(args.env_path, None)
@@ -268,7 +285,13 @@ def main() -> None:
     sa, _ = reconstruct_autoencoder(resolve_checkpoint_path(args.sa_checkpoint), config)
     sa.to(device).eval()
 
-    policy = SlotSelectionPolicyGRU(
+    # ── build the right model from checkpoint meta ────────────────────────────
+    selector_path = resolve_checkpoint_path(args.selector_checkpoint)
+    head_type = peek_head_type(selector_path)
+    print(f"head_type from checkpoint: {head_type}")
+
+    policy = build_policy(
+        head_type=head_type,
         slot_dim=config.slot_dim,
         embed_dim=config.rnn_sel_embed_dim,
         hidden_dim=config.rnn_sel_hidden_dim,
@@ -276,7 +299,6 @@ def main() -> None:
         num_classes=config.ds_num_classes,
         use_stop_action=not config.rnn_sel_force_full_rollout,
     ).to(device)
-    selector_path = resolve_checkpoint_path(args.selector_checkpoint)
     meta = load_selector(selector_path, policy, device)
     policy.eval()
 
@@ -298,7 +320,7 @@ def main() -> None:
     confusion = torch.zeros(config.ds_num_classes, config.ds_num_classes, dtype=torch.long)
 
     max_samples = None if args.max_samples < 0 else args.max_samples
-    loader = tqdm(dataloaders[args.split], desc=f"RNN-only {args.split}")
+    loader = tqdm(dataloaders[args.split], desc=f"RNN-variant [{head_type}] {args.split}")
 
     slot_kw: dict = {"num_slots": config.num_slots, "slot_dim": config.slot_dim}
     if config.rnn_sel_sa_deterministic_slots:
@@ -369,6 +391,7 @@ def main() -> None:
                 split=args.split,
                 tau=tau,
                 global_init=global_init_effective,
+                head_type=head_type,
                 selector_checkpoint=selector_path,
                 meta=meta,
                 out_path=str(out_path),
@@ -377,11 +400,11 @@ def main() -> None:
                 correct_examples += 1
             else:
                 wrong_examples += 1
-
             sample_index += 1
 
         loader.set_postfix(
             acc=f"{correct / max(total, 1):.4f}",
+            head=head_type,
             correct_imgs=correct_examples,
             wrong_imgs=wrong_examples,
         )
@@ -396,6 +419,7 @@ def main() -> None:
 
     metrics = {
         "split": args.split,
+        "head_type": head_type,
         "total": total,
         "accuracy": correct / max(total, 1),
         "correct": correct,
@@ -418,25 +442,19 @@ def main() -> None:
     with open(metrics_path, "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
 
-    print("\n=== RNN-only inference metrics ===")
+    print(f"\n=== RNN variant inference metrics  [head={head_type}] ===")
     for key in [
-        "total",
-        "accuracy",
-        "correct",
-        "wrong",
-        "stop_rate",
-        "avg_steps",
-        "avg_pmax",
-        "avg_p_true",
+        "total", "accuracy", "correct", "wrong",
+        "stop_rate", "avg_steps", "avg_pmax", "avg_p_true",
     ]:
         value = metrics[key]
         if isinstance(value, float):
             print(f"{key}: {value:.6f}")
         else:
             print(f"{key}: {value}")
-    print(f"Saved metrics: {metrics_path}")
-    print(f"Saved correct examples: {correct_dir}")
-    print(f"Saved wrong examples: {wrong_dir}")
+    print(f"Saved metrics : {metrics_path}")
+    print(f"Correct examples : {correct_dir}")
+    print(f"Wrong examples   : {wrong_dir}")
 
 
 if __name__ == "__main__":

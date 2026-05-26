@@ -66,7 +66,8 @@ def run_rnn_inference(
         raise ValueError("visualization expects a single image")
 
     device = slots.device
-    h = policy.init_hidden_from_slots(slots) if global_init else policy.init_hidden(1, device)
+    h = policy.init_hidden(1, device)
+    E = policy.init_evidence(1, device)
     selected_mask = torch.zeros(1, k, device=device, dtype=torch.bool)
     trace: list[dict] = []
 
@@ -79,10 +80,13 @@ def run_rnn_inference(
             action_logits[:, k:] = fill
 
         slot_id = int(action_logits.argmax(dim=-1).item())
-        h = policy.step_hidden(slots[:, slot_id], h)
+        h_prev = h
+        h, x = policy.step_hidden(slots[:, slot_id], h)
+        delta = h - h_prev
+        E = policy.step_evidence(delta, x, E)
         selected_mask[0, slot_id] = True
 
-        cls_logits = policy.class_head(h)
+        cls_logits, _ = policy.class_head(h, None, selected_mask, E=E)
         probs = F.softmax(cls_logits, dim=-1)
         pred = int(cls_logits.argmax(dim=-1).item())
         pmax = float(probs.max(dim=-1).values.item())
