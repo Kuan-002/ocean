@@ -225,7 +225,7 @@ class SlotSelectionPolicyGRU(nn.Module):
 
     # ── heads ─────────────────────────────────────────────────────────────────
 
-    def forward_logits(self, hidden: torch.Tensor) -> torch.Tensor:
+    def forward_logits(self, hidden: torch.Tensor, slot_embeds=None) -> torch.Tensor:
         """policy_t ∥ stop_t  →  [B, K] or [B, K+1]."""
         policy_logits = self._policy_head(hidden)             # [B, K]
         if self.use_stop_action and self._stop_head is not None:

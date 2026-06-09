@@ -181,6 +181,17 @@ class Config:
         self.rnn_sel_reward_area_ptrue_weight = float(os.getenv("RNN_SEL_REWARD_AREA_PTRUE_WEIGHT", "0.0"))
         self.rnn_sel_kl_step_ramp = os.getenv("RNN_SEL_KL_STEP_RAMP", "False").lower() == "true"
         self.rnn_sel_lclass_step_ramp = os.getenv("RNN_SEL_LCLASS_STEP_RAMP", "False").lower() == "true"
+        self.rnn_sel_grpo_train_temp = float(os.getenv("RNN_SEL_GRPO_TRAIN_TEMP", "1.0"))
+        self.rnn_sel_lclass_late_ramp = os.getenv("RNN_SEL_LCLASS_LATE_RAMP", "False").lower() == "true"
+        # Per-class slot count targets (comma-separated, order matches class indices)
+        _targets_str = os.getenv("RNN_SEL_CLASS_SLOT_TARGETS", "").strip()
+        self.rnn_sel_class_slot_targets = (
+            [int(x) for x in _targets_str.split(",") if x.strip()]
+            if _targets_str else None
+        )
+        self.rnn_sel_reward_slot_count_weight = float(
+            os.getenv("RNN_SEL_REWARD_SLOT_COUNT_WEIGHT", "0.0")
+        )
 
     def _load_trainer_config(self):
         self.epochs = int(os.getenv("EPOCHS", 500))

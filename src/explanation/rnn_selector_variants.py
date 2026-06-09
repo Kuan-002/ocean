@@ -28,6 +28,8 @@ Factory
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 
@@ -116,7 +118,7 @@ class SlotSelectionPolicyLinear(nn.Module):
 
     # ── heads ─────────────────────────────────────────────────────────────────
 
-    def forward_logits(self, hidden: torch.Tensor) -> torch.Tensor:
+    def forward_logits(self, hidden: torch.Tensor, slot_embeds=None) -> torch.Tensor:
         """policy_t ∥ stop_t  →  [B, K] or [B, K+1]."""
         policy_logits = self._policy_head(hidden)
         if self.use_stop_action and self._stop_head is not None:
@@ -243,7 +245,7 @@ class SlotSelectionPolicyCrossAttn(nn.Module):
 
     # ── heads ─────────────────────────────────────────────────────────────────
 
-    def forward_logits(self, hidden: torch.Tensor) -> torch.Tensor:
+    def forward_logits(self, hidden: torch.Tensor, slot_embeds=None) -> torch.Tensor:
         """policy_t ∥ stop_t  →  [B, K] or [B, K+1]."""
         policy_logits = self._policy_head(hidden)
         if self.use_stop_action and self._stop_head is not None:
@@ -502,6 +504,305 @@ class SlotSelectionPolicyGRUAttn(nn.Module):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# E. Global-Attn head  —  class_head attends over ALL K slots (h0 = 0)
+# ═════════════════════════════════════════════════════════════════════════════
+
+class SlotSelectionPolicyGlobalAttn(nn.Module):
+    """
+    GRU action selection (h0 = 0) + cross-attention classification over ALL K slots.
+
+    Architecture (per step t)
+    ─────────────────────────
+      x_t          = input_proj(slot_t)       SlotEncoder
+      h_t          = GRU(x_t, h_{t-1})        main GRU  (h_0 = 0, never warm-started)
+      policy_t     = PolicyHead(h_t)           slot-selection logits [K]
+      stop_t       = StopHead(h_t)             stop logit [1]
+      class_logits = CrossAttnHead(h_t,        cross-attention over ALL K slots
+                                   all_embeds, (no selected_mask applied)
+                                   all_true)
+
+    Unlike SlotSelectionPolicyCrossAttn (which masks unselected slots),
+    the classifier here always has a full view of every slot embedding.
+    The GRU hidden state encodes the sequential selection context;
+    the cross-attention head lets the classifier directly weight all K slots.
+
+    selected_mask is used only for action masking (no repeat selections), NOT
+    for the classification cross-attention.
+
+    Evidence state E is a no-op pass-through (API compatibility).
+    """
+
+    def __init__(
+        self,
+        slot_dim: int,
+        embed_dim: int,
+        hidden_dim: int,
+        num_slots: int,
+        num_classes: int,
+        use_stop_action: bool = True,
+        class_head_num_heads: int = 4,
+        class_head_dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.num_slots = num_slots
+        self.use_stop_action = use_stop_action
+        self.stop_idx = num_slots
+        self.num_classes = num_classes
+        self.hidden_dim = hidden_dim
+        self.embed_dim = embed_dim
+
+        self.input_proj = nn.Sequential(
+            nn.Linear(slot_dim, embed_dim),
+            nn.ReLU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+        self.gru = nn.GRUCell(embed_dim, hidden_dim)
+        self._policy_head = nn.Linear(hidden_dim, num_slots)
+        self._stop_head = nn.Linear(hidden_dim, 1) if use_stop_action else None
+        self._class_head = SlotCrossAttentionClassHead(
+            hidden_dim=hidden_dim,
+            embed_dim=embed_dim,
+            num_classes=num_classes,
+            num_heads=class_head_num_heads,
+            dropout=class_head_dropout,
+        )
+
+    # ── initialisation ────────────────────────────────────────────────────────
+
+    def init_hidden(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        return torch.zeros(batch_size, self.hidden_dim, device=device)
+
+    def init_evidence(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        return torch.zeros(batch_size, self.hidden_dim, device=device)
+
+    def init_slot_cache(self, batch_size: int, device) -> None:
+        return None
+
+    def update_slot_cache(self, slot_cache, x: torch.Tensor, active: torch.Tensor) -> None:
+        return None
+
+    # ── per-step computations ─────────────────────────────────────────────────
+
+    def step_hidden(
+        self, selected_slots: torch.Tensor, hidden: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        x = self.input_proj(selected_slots)
+        h_new = self.gru(x, hidden)
+        return h_new, x
+
+    def step_evidence(
+        self, delta: torch.Tensor, x: torch.Tensor, E_prev: torch.Tensor,
+        slot_cache=None,
+    ) -> torch.Tensor:
+        return E_prev
+
+    # ── heads ─────────────────────────────────────────────────────────────────
+
+    def forward_logits(self, hidden: torch.Tensor) -> torch.Tensor:
+        policy_logits = self._policy_head(hidden)
+        if self.use_stop_action and self._stop_head is not None:
+            stop_logit = self._stop_head(hidden)
+            return torch.cat([policy_logits, stop_logit], dim=-1)
+        return policy_logits
+
+    def class_head(
+        self,
+        h: torch.Tensor,
+        slot_embeds: torch.Tensor | None,
+        selected_mask: torch.Tensor | None = None,  # ignored for classification
+        E: torch.Tensor | None = None,               # unused; API compat
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """
+        class_logits = CrossAttn(h, ALL slot_embeds).
+        selected_mask is intentionally ignored here: classification attends to
+        every slot regardless of which slots the action GRU has visited so far.
+        """
+        if slot_embeds is None:
+            return self._class_head.h_only(h), None
+        # All-true mask → attend to every slot (key_padding_mask = all False)
+        all_mask = torch.ones(
+            slot_embeds.shape[:2], dtype=torch.bool, device=slot_embeds.device
+        )
+        return self._class_head(h, slot_embeds, all_mask)
+
+    def precompute_slot_embeds(self, slots: torch.Tensor) -> torch.Tensor:
+        """Returns input_proj(slots) [B, K, embed_dim]; computed once per rollout."""
+        return self.input_proj(slots)
+
+    def apply_action_mask(
+        self, logits: torch.Tensor, selected_mask: torch.Tensor
+    ) -> torch.Tensor:
+        masked = logits.clone()
+        mask_fill = torch.finfo(logits.dtype).min / 2
+        masked[:, : self.num_slots] = masked[:, : self.num_slots].masked_fill(
+            selected_mask, mask_fill
+        )
+        return masked
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# F. Attention-select head  —  action via attn(h, ALL slots); classify via SELECTED slots
+# ═════════════════════════════════════════════════════════════════════════════
+
+class SlotSelectionPolicyAttnSelect(nn.Module):
+    """
+    Sequential slot-selection policy separating global awareness from local evidence.
+
+    Architecture (per step t)
+    ─────────────────────────
+      x_t          = input_proj(slot_t)         SlotEncoder
+      h_t          = GRU(x_t, h_{t-1})          main GRU  (h_0 = 0)
+
+      [ACTION — global view]
+      q_t          = action_query_proj(h_t)      [B, embed_dim]
+      scores_t     = q_t @ E_all^T / √d          [B, K]  dot-product with ALL slots
+      mask → argmax → select next slot
+
+      [CLASSIFICATION — restricted view]
+      class_logits = CrossAttnHead(h_t,          cross-attention over
+                                   E_selected)   ONLY already-selected slots
+
+    Separation principle:
+      The agent can survey the full scene when deciding what to look at next,
+      but its classification conclusion is only based on slots it has explicitly
+      examined.  This forces genuine evidence accumulation: confidence grows
+      only as more relevant slots are selected.
+
+    Evidence state E is a no-op pass-through (API compatibility).
+    """
+
+    def __init__(
+        self,
+        slot_dim: int,
+        embed_dim: int,
+        hidden_dim: int,
+        num_slots: int,
+        num_classes: int,
+        use_stop_action: bool = True,
+        class_head_num_heads: int = 4,
+        class_head_dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.num_slots = num_slots
+        self.use_stop_action = use_stop_action
+        self.stop_idx = num_slots
+        self.num_classes = num_classes
+        self.hidden_dim = hidden_dim
+        self.embed_dim = embed_dim
+
+        self.input_proj = nn.Sequential(
+            nn.Linear(slot_dim, embed_dim),
+            nn.ReLU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+        self.gru = nn.GRUCell(embed_dim, hidden_dim)
+
+        # Action head: project h to embed_dim for dot-product with slot embeddings
+        self._action_query_proj = nn.Linear(hidden_dim, embed_dim, bias=False)
+        self._stop_head = nn.Linear(hidden_dim, 1) if use_stop_action else None
+
+        # Classification head: cross-attention over SELECTED slots only
+        self._class_head = SlotCrossAttentionClassHead(
+            hidden_dim=hidden_dim,
+            embed_dim=embed_dim,
+            num_classes=num_classes,
+            num_heads=class_head_num_heads,
+            dropout=class_head_dropout,
+        )
+
+        # Evidence accumulation: gated running sum of selected x_t embeddings.
+        # gate(delta_t) controls how much x_t is folded into E.
+        self._evidence_gate = nn.Linear(hidden_dim, embed_dim)
+        # Project accumulated E (embed_dim) → hidden_dim to augment cross-attn query.
+        self._evidence_merge = nn.Linear(embed_dim, hidden_dim, bias=False)
+
+    # ── initialisation ────────────────────────────────────────────────────────
+
+    def init_hidden(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        return torch.zeros(batch_size, self.hidden_dim, device=device)
+
+    def init_evidence(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        # E lives in embed_dim space (gated running sum of x_t vectors).
+        return torch.zeros(batch_size, self.embed_dim, device=device)
+
+    def init_slot_cache(self, batch_size: int, device) -> None:
+        return None
+
+    def update_slot_cache(self, slot_cache, x: torch.Tensor, active: torch.Tensor) -> None:
+        return None
+
+    # ── per-step computations ─────────────────────────────────────────────────
+
+    def step_hidden(
+        self, selected_slots: torch.Tensor, hidden: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        x = self.input_proj(selected_slots)
+        h_new = self.gru(x, hidden)
+        return h_new, x
+
+    def step_evidence(
+        self, delta: torch.Tensor, x: torch.Tensor, E_prev: torch.Tensor,
+        slot_cache=None,
+    ) -> torch.Tensor:
+        # Gated running sum: gate driven by GRU delta (how much h changed this step).
+        gate = torch.sigmoid(self._evidence_gate(delta))  # [B, embed_dim]
+        return E_prev + gate * x
+
+    # ── heads ─────────────────────────────────────────────────────────────────
+
+    def forward_logits(self, hidden: torch.Tensor, slot_embeds=None) -> torch.Tensor:
+        """
+        Action logits via dot-product attention: proj(h) @ E_all^T / √d.
+        Falls back to a linear head if slot_embeds is not provided.
+        Stop logit appended when use_stop_action is True.
+        """
+        if slot_embeds is not None:
+            q = self._action_query_proj(hidden)                    # [B, embed_dim]
+            scores = (q.unsqueeze(1) @ slot_embeds.transpose(-1, -2)).squeeze(1)
+            scores = scores / math.sqrt(self.embed_dim)            # [B, K]
+        else:
+            # Fallback: linear projection (used only if slot_embeds is unavailable)
+            scores = self._action_query_proj(hidden) @ self._action_query_proj.weight.T
+            scores = scores[:, :self.num_slots]
+
+        if self.use_stop_action and self._stop_head is not None:
+            stop_logit = self._stop_head(hidden)                   # [B, 1]
+            return torch.cat([scores, stop_logit], dim=-1)         # [B, K+1]
+        return scores
+
+    def class_head(
+        self,
+        h: torch.Tensor,
+        slot_embeds: torch.Tensor | None,
+        selected_mask: torch.Tensor | None = None,
+        E: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """
+        class_logits = CrossAttn(h_aug, E_selected).
+        Query is h augmented by the accumulated evidence E via _evidence_merge.
+        Falls back to h_only when no slots have been selected yet.
+        """
+        h_aug = h + self._evidence_merge(E) if E is not None else h
+        if slot_embeds is None or selected_mask is None or not selected_mask.any():
+            return self._class_head.h_only(h_aug), None
+        return self._class_head(h_aug, slot_embeds, selected_mask)
+
+    def precompute_slot_embeds(self, slots: torch.Tensor) -> torch.Tensor:
+        """Returns input_proj(slots) [B, K, embed_dim]; computed once per rollout."""
+        return self.input_proj(slots)
+
+    def apply_action_mask(
+        self, logits: torch.Tensor, selected_mask: torch.Tensor
+    ) -> torch.Tensor:
+        masked = logits.clone()
+        mask_fill = torch.finfo(logits.dtype).min / 2
+        masked[:, : self.num_slots] = masked[:, : self.num_slots].masked_fill(
+            selected_mask, mask_fill
+        )
+        return masked
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Factory
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -574,8 +875,31 @@ def build_policy(
             use_stop_action=use_stop_action,
             evidence_attn_heads=class_head_num_heads,
         )
+    elif ht == "all_slots_attn":
+        return SlotSelectionPolicyGlobalAttn(
+            slot_dim=slot_dim,
+            embed_dim=embed_dim,
+            hidden_dim=hidden_dim,
+            num_slots=num_slots,
+            num_classes=num_classes,
+            use_stop_action=use_stop_action,
+            class_head_num_heads=class_head_num_heads,
+            class_head_dropout=class_head_dropout,
+        )
+    elif ht == "attn_select":
+        return SlotSelectionPolicyAttnSelect(
+            slot_dim=slot_dim,
+            embed_dim=embed_dim,
+            hidden_dim=hidden_dim,
+            num_slots=num_slots,
+            num_classes=num_classes,
+            use_stop_action=use_stop_action,
+            class_head_num_heads=class_head_num_heads,
+            class_head_dropout=class_head_dropout,
+        )
     else:
         raise ValueError(
             f"Unknown head_type '{head_type}'. "
-            "Choose from: 'linear', 'crossattn', 'evidence', 'attn_evidence'."
+            "Choose from: 'linear', 'crossattn', 'evidence', 'attn_evidence', "
+            "'all_slots_attn', 'attn_select'."
         )

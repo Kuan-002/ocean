@@ -48,6 +48,8 @@ def run_rnn_inference_batch(
     final_p_true = torch.zeros(bsz, device=device)
     steps = torch.zeros(bsz, device=device)
     stopped = torch.zeros(bsz, device=device, dtype=torch.bool)
+    t_star = torch.full((bsz,), k, device=device, dtype=torch.long)
+    t_star_found = torch.zeros(bsz, device=device, dtype=torch.bool)
 
     for step in range(k):
         active = ~done
@@ -55,7 +57,7 @@ def run_rnn_inference_batch(
             break
         steps = steps + active.float()
 
-        action_logits = policy.apply_action_mask(policy.forward_logits(h), selected_mask)
+        action_logits = policy.apply_action_mask(policy.forward_logits(h, slot_embeds), selected_mask)
         if action_logits.size(1) > k:
             fill = torch.finfo(action_logits.dtype).min / 2
             action_logits = action_logits.clone()
@@ -89,6 +91,12 @@ def run_rnn_inference_batch(
         final_pmax[active_idx] = pmax[active_idx]
         final_p_true[active_idx] = p_true[active_idx]
 
+        # Track t* = first step where pmax >= tau (matches training definition)
+        just_reached = active & ~t_star_found & (pmax >= tau)
+        if just_reached.any():
+            t_star[just_reached] = step + 1
+            t_star_found = t_star_found | just_reached
+
         reached = active & (pmax >= tau)
         if not force_full:
             stopped = stopped | reached
@@ -109,6 +117,8 @@ def run_rnn_inference_batch(
         "steps": steps,
         "stopped": stopped,
         "selected_mask": selected_mask,
+        "t_star": t_star,
+        "t_star_found": t_star_found,
     }
 
 
@@ -146,6 +156,10 @@ class SelectorConfig:
         "reward_area_ptrue_weight",
         "kl_step_ramp",
         "lclass_step_ramp",
+        "lclass_late_ramp",
+        "class_slot_targets",
+        "reward_slot_count_weight",
+        "grpo_train_temp",
     )
 
     def __init__(
@@ -181,6 +195,10 @@ class SelectorConfig:
         reward_area_ptrue_weight: float = 0.0,
         kl_step_ramp: bool = True,
         lclass_step_ramp: bool = False,
+        lclass_late_ramp: bool = False,
+        class_slot_targets: list | None = None,
+        reward_slot_count_weight: float = 0.0,
+        grpo_train_temp: float = 1.0,
     ) -> None:
         self.num_slots = num_slots
         self.tau = tau
@@ -212,6 +230,10 @@ class SelectorConfig:
         self.reward_area_ptrue_weight = reward_area_ptrue_weight
         self.kl_step_ramp = kl_step_ramp
         self.lclass_step_ramp = lclass_step_ramp
+        self.lclass_late_ramp = lclass_late_ramp
+        self.class_slot_targets = class_slot_targets
+        self.reward_slot_count_weight = reward_slot_count_weight
+        self.grpo_train_temp = grpo_train_temp
 
 
 def _run_full_order_rollout(
@@ -270,9 +292,9 @@ def _run_full_order_rollout(
             break
         episode_len = episode_len + active.float()
 
-        logits = policy.apply_action_mask(policy.forward_logits(h), selected_mask)
+        logits = policy.apply_action_mask(policy.forward_logits(h, slot_embeds), selected_mask)
         with torch.no_grad():
-            lr = ref_policy.apply_action_mask(ref_policy.forward_logits(h), selected_mask)
+            lr = ref_policy.apply_action_mask(ref_policy.forward_logits(h, slot_embeds), selected_mask)
         if logits.size(1) > k:
             fill = torch.finfo(logits.dtype).min / 2
             logits = logits.clone()
@@ -292,7 +314,10 @@ def _run_full_order_rollout(
         pt = log_pt.exp()
         kl = (pt * (log_pt - log_pref)).sum(dim=-1)
 
-        dist = torch.distributions.Categorical(logits=logits)
+        if train and cfg.grpo_train_temp != 1.0:
+            dist = torch.distributions.Categorical(logits=logits / cfg.grpo_train_temp)
+        else:
+            dist = torch.distributions.Categorical(logits=logits)
         actions = dist.sample() if train else logits.argmax(dim=-1)
         if action_trace is not None:
             action_trace.append(actions.detach().clone())
@@ -339,9 +364,7 @@ def _run_full_order_rollout(
             kl_cls = (t_p * (t_lp - s_lp)).sum(dim=-1)
             class_kl_steps.append(ramp * torch.where(active, kl_cls, torch.zeros_like(kl_cls)))
 
-        pred_step = cls_logits.detach().argmax(-1)
-        just_reached = (active & ~t_star_found & (prefix_conf >= threshold)
-                        & (pred_step == _step_target))
+        just_reached = active & ~t_star_found & (prefix_conf >= threshold)
         if just_reached.any():
             t_star[just_reached] = step + 1
             t_star_found = t_star_found | just_reached
@@ -362,7 +385,7 @@ def _run_full_order_rollout(
         h_final[still] = h[still]
         E_final[still] = E[still]
         cls_logits_final[still], _ = policy.class_head(
-            h[still], None, selected_mask[still], E=E[still]
+            h[still], slot_embeds[still], selected_mask[still], E=E[still]
         )
 
     log_st = torch.stack(log_probs_steps, dim=0)
@@ -394,9 +417,29 @@ def _run_full_order_rollout(
     p_true_stack = torch.stack(p_true_steps, dim=0)  # [T, B]
     R_area_ptrue = (p_true_stack * prefix_valid).sum(dim=0) / prefix_valid.sum(dim=0).clamp(min=1e-6)
 
+    # Slot-count matching reward: encourage t_star ≈ class-required object count.
+    R_slot_count = torch.zeros(bsz, device=device)
+    if cfg.reward_slot_count_weight > 0 and cfg.class_slot_targets is not None:
+        tgts = torch.tensor(cfg.class_slot_targets, device=device, dtype=torch.float)
+        target_counts = tgts[_reward_target.clamp(0, len(cfg.class_slot_targets) - 1)]
+        count_diff = (t_star.float() - target_counts).abs()
+        R_slot_count = torch.where(
+            t_star_found,
+            (1.0 - count_diff / float(cfg.num_slots)).clamp(min=0.0),
+            torch.zeros(bsz, device=device),
+        )
+
     R = (cfg.reward_rule_weight * R_rule
          + cfg.reward_rank_weight * R_rule * R_rank
-         + cfg.reward_area_ptrue_weight * R_area_ptrue)
+         + cfg.reward_area_ptrue_weight * R_area_ptrue
+         + cfg.reward_slot_count_weight * R_slot_count)
+
+    # Confident-stop bonus/penalty: t* found → reward correct, penalise wrong.
+    # fail_pen = success_reward × (1−τ) keeps E[R|stop at τ] > 0 even under miscalibration.
+    conf_correct = t_star_found & (pred_final_r == _reward_target)
+    conf_wrong   = t_star_found & (pred_final_r != _reward_target)
+    R = R + conf_correct.float() * cfg.success_reward
+    R = R - conf_wrong.float() * (cfg.success_reward * (1.0 - cfg.tau))
 
     if class_kl_steps:
         kl_class_stack = torch.stack(class_kl_steps, dim=0)
@@ -412,7 +455,15 @@ def _run_full_order_rollout(
         _cls_target.unsqueeze(0).expand(cls_stack.size(0), bsz).reshape(-1),
         reduction="none",
     ).view(cls_stack.size(0), bsz)
-    if cfg.lclass_step_ramp and cfg.area_decay_alpha > 0.0:
+    if cfg.lclass_late_ramp:
+        # Linear ramp: step t (0-indexed) gets weight (t+1)/T_s — later steps weighted more.
+        T_s = cls_stack.size(0)
+        step_w = torch.arange(1, T_s + 1, device=device, dtype=torch.float) / T_s
+        step_w = step_w / step_w.sum()
+        L_class = (ce_steps * cls_valid * step_w.unsqueeze(1)).sum() / (
+            cls_valid * step_w.unsqueeze(1)
+        ).sum().clamp(min=1e-6)
+    elif cfg.lclass_step_ramp and cfg.area_decay_alpha > 0.0:
         T_s = cls_stack.size(0)
         step_w = torch.pow(
             torch.tensor(1.0 - cfg.area_decay_alpha, device=device),
@@ -444,6 +495,7 @@ def _run_full_order_rollout(
         "R_rule": R_rule,
         "R_rank": R_rank,
         "R_area_ptrue": R_area_ptrue,
+        "R_slot_count": R_slot_count,
         "kl_class_mean": kl_class_mean,
     }
 
@@ -499,10 +551,10 @@ def run_grpo_rollout(
             break
         episode_len = episode_len + active.float()
 
-        logits = policy.forward_logits(h)
+        logits = policy.forward_logits(h, slot_embeds)
         logits = policy.apply_action_mask(logits, selected_mask)
         with torch.no_grad():
-            lr = ref_policy.forward_logits(h)
+            lr = ref_policy.forward_logits(h, slot_embeds)
             lr = ref_policy.apply_action_mask(lr, selected_mask)
 
         if not torch.isfinite(logits).all():
@@ -590,7 +642,8 @@ def run_grpo_rollout(
         h_final[still] = h[still]
         E_final[still] = E[still]
         cls_logits_final[still], _ = policy.class_head(
-            h[still], None, selected_mask[still], E=E[still]
+            h[still], slot_embeds[still] if slot_embeds is not None else None,
+            selected_mask[still], E=E[still]
         )
 
     subset_norm = selected_mask.float().sum(dim=-1) / float(cfg.num_slots)
@@ -657,11 +710,6 @@ def train_grpo_epoch(
         "L_grpo": 0.0,
         "L_class": 0.0,
         "mean_R": 0.0,
-        "success_rate": 0.0,
-        "gt_acc": 0.0,
-        "avg_subset_size": 0.0,
-        "avg_final_p": 0.0,
-        "avg_t_star": 0.0,
         "n": 0,
     }
 
@@ -732,24 +780,10 @@ def train_grpo_epoch(
             torch.nn.utils.clip_grad_norm_(policy.parameters(), cfg.max_grad_norm)
         optimiser.step()
 
-        with torch.no_grad():
-            if "t_star_found" in out:
-                succ = out["t_star_found"]
-            else:
-                succ = out["p_conf"] >= cfg.tau
-            gt_acc = (out["cls_logits_final"].argmax(-1) == gt_labels_e).float().mean()
-            k_avg = out["selected_mask"].float().sum(-1).mean()
-
         meter["loss"] += float(loss.item()) * bsz
         meter["L_grpo"] += float(L_grpo.item()) * bsz
         meter["L_class"] += float(L_class.item()) * bsz
         meter["mean_R"] += float(R.mean().item()) * bsz
-        meter["success_rate"] += float(succ.float().mean().item()) * bsz
-        meter["gt_acc"] += float(gt_acc.item()) * bsz
-        meter["avg_subset_size"] += float(k_avg.item()) * bsz
-        meter["avg_final_p"] += float(out["p_conf"].mean().item()) * bsz
-        if "t_star" in out:
-            meter["avg_t_star"] += float(out["t_star"].float().mean().item()) * bsz
         meter["n"] += bsz
 
     n = max(meter["n"], 1)
@@ -807,13 +841,15 @@ def eval_rnn_selector(
     total = 0
     acc = {
         "success_rate": 0.0,
-        "gt_acc": 0.0,
         "avg_subset_size": 0.0,
         "avg_final_p": 0.0,
         "mean_R": 0.0,
         "mean_steps": 0.0,
         "avg_t_star": 0.0,
     }
+    # Per-class t_star accumulation (steps to first reach tau for each GT class)
+    cls_tstar_sum: dict[int, float] = {}
+    cls_tstar_count: dict[int, int] = {}
 
     ref_policy = policy
     slot_kw = slot_opts or {}
@@ -849,19 +885,32 @@ def eval_rnn_selector(
             succ_rate = out["t_star_found"].float().mean().item()
         else:
             succ_rate = (out["p_conf"] >= cfg.tau).float().mean().item()
-        gt_correct = (out["cls_logits_final"].argmax(-1) == labels).float().mean().item()
-
         acc["success_rate"] += float(succ_rate) * b
-        acc["gt_acc"] += float(gt_correct) * b
         acc["avg_subset_size"] += float(out["selected_mask"].float().sum(-1).mean().item()) * b
         acc["avg_final_p"] += float(out["p_conf"].mean().item()) * b
         acc["mean_R"] += float(R.mean().item()) * b
         acc["mean_steps"] += float(out["episode_len"].mean().item()) * b
         if "t_star" in out:
             acc["avg_t_star"] += float(out["t_star"].float().mean().item()) * b
+
+        # Per-class t_star: use K (max steps) when not found
+        if "t_star" in out and "t_star_found" in out:
+            t_star_b = out["t_star"]
+            found_b = out["t_star_found"]
+            for i in range(labels.size(0)):
+                c = int(labels[i].item())
+                t_val = float(t_star_b[i].item()) if found_b[i].item() else float(cfg.num_slots)
+                cls_tstar_sum[c] = cls_tstar_sum.get(c, 0.0) + t_val
+                cls_tstar_count[c] = cls_tstar_count.get(c, 0) + 1
+
         total += b
         if max_samples is not None and total >= max_samples:
             break
 
     total = max(total, 1)
-    return {k: v / total for k, v in acc.items()}
+    result = {k: v / total for k, v in acc.items()}
+    result["per_class_t_star"] = {
+        c: cls_tstar_sum[c] / max(cls_tstar_count[c], 1)
+        for c in sorted(cls_tstar_count)
+    }
+    return result

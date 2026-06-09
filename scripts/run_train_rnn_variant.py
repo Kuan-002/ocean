@@ -182,6 +182,10 @@ def main() -> None:
         reward_area_ptrue_weight=config.rnn_sel_reward_area_ptrue_weight,
         kl_step_ramp=config.rnn_sel_kl_step_ramp,
         lclass_step_ramp=config.rnn_sel_lclass_step_ramp,
+        lclass_late_ramp=config.rnn_sel_lclass_late_ramp,
+        class_slot_targets=config.rnn_sel_class_slot_targets,
+        reward_slot_count_weight=config.rnn_sel_reward_slot_count_weight,
+        grpo_train_temp=config.rnn_sel_grpo_train_temp,
     )
 
     optimiser = torch.optim.AdamW(
@@ -235,6 +239,17 @@ def main() -> None:
             dataloaders["train"], optimiser, device, sel_cfg,
             slot_opts=slot_kw,
         )
+        # Greedy eval on training subset — identical strategy to val
+        train_eval_stats = eval_rnn_selector(
+            sa, policy, dataloaders["train"], device, sel_cfg,
+            max_samples=config.rnn_sel_eval_samples, clf=clf,
+            slot_opts=slot_kw,
+        )
+        train_rnn_acc = eval_rnn_classifier_accuracy(
+            sa, policy, dataloaders["train"], device, sel_cfg,
+            max_samples=config.rnn_sel_eval_samples,
+            slot_opts=slot_kw,
+        )
         val_stats = eval_rnn_selector(
             sa, policy, dataloaders["val"], device, sel_cfg,
             max_samples=config.rnn_sel_eval_samples, clf=clf,
@@ -245,16 +260,20 @@ def main() -> None:
             max_samples=config.rnn_sel_eval_samples,
             slot_opts=slot_kw,
         )
+        per_cls = val_stats.get("per_class_t_star", {})
+        per_cls_str = " ".join(f"c{c}:{v:.2f}" for c, v in sorted(per_cls.items()))
         print(
             f"epoch={epoch} loss={train_stats['loss']:.4f} "
             f"L_grpo={train_stats['L_grpo']:.4f} L_class={train_stats['L_class']:.4f} "
-            f"train_succ={train_stats['success_rate']:.4f} train_gtacc={train_stats['gt_acc']:.4f} "
-            f"train_k={train_stats['avg_subset_size']:.2f} "
-            f"val_succ={val_stats['success_rate']:.4f} val_gtacc={val_stats['gt_acc']:.4f} "
+            f"train_succ={train_eval_stats['success_rate']:.4f} "
+            f"train_k={train_eval_stats['avg_subset_size']:.2f} "
+            f"train_rnn_acc={train_rnn_acc:.4f} "
+            f"val_succ={val_stats['success_rate']:.4f} "
             f"val_k={val_stats['avg_subset_size']:.2f} "
             f"val_rnn_acc={val_rnn_acc:.4f} val_p={val_stats['avg_final_p']:.4f} "
-            f"train_t*={train_stats['avg_t_star']:.2f} val_t*={val_stats['avg_t_star']:.2f} "
+            f"train_t*={train_eval_stats['avg_t_star']:.2f} val_t*={val_stats['avg_t_star']:.2f} "
             f"tstar_scale={sel_cfg.tstar_p_full_scale:.3f}"
+            + (f"\n  per_class_t*=[{per_cls_str}]" if per_cls_str else "")
         )
 
         improved = False
