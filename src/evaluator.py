@@ -31,6 +31,7 @@ class Evaluator:
         self.num_slots = config.num_slots
         self.slot_dim = config.slot_dim
         self.device = config.device
+        self.max_val_batches = config.max_val_batches
 
         self.game_lengths = []
         self.empty_slot_percentages = []
@@ -88,7 +89,9 @@ class Evaluator:
         )
         total_loss, count = 0, 0
 
-        for _, (x, _, _) in loader:
+        for batch_idx, (x, _, _) in loader:
+            if self.max_val_batches > 0 and batch_idx >= self.max_val_batches:
+                break
             x = x.to(self.device)
             self.sa.zero_grad(set_to_none=True)
             with torch.no_grad():

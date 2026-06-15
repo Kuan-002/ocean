@@ -17,7 +17,7 @@ class Config:
         
         # Set up output directory, if it exists, create a new one with a different name.
         if out_subpath is not None:
-            self.out_subpath = get_unique_dir(out_subpath)
+            self.out_subpath = os.path.join(get_unique_dir(out_subpath), "")
             os.makedirs(self.out_subpath)
 
             self.checkpoint_path = get_unique_dir(os.path.join(self.out_subpath, "checkpoints/"))
@@ -51,6 +51,8 @@ class Config:
         self.use_gpu = self.device == "cuda" and torch.cuda.is_available()
         self.tqdm_interval = 1 if os.environ.get("IS_NOHUP") is None else 60
         self.debug = os.getenv("DEBUG", "False").lower() == "true"
+        self.max_train_batches = int(os.getenv("MAX_TRAIN_BATCHES", "0"))
+        self.max_val_batches = int(os.getenv("MAX_VAL_BATCHES", "0"))
     
     def _load_SA_config(self):
         # Slot Attention Model
@@ -208,6 +210,8 @@ class Config:
         self.sa_loss_weight = float(os.getenv("SA_LOSS_WEIGHT", 1.0))
         self.em_reward_sa_loss_scaling = float(os.getenv("EM_REWARD_SA_LOSS_SCALING", 0.001))
         self.min_save_epochs = int(os.getenv("MIN_SAVE_EPOCHS", 100))
+        self.sa_early_stop_patience = int(os.getenv("SA_EARLY_STOP_PATIENCE", "0"))
+        self.sa_early_stop_min_delta = float(os.getenv("SA_EARLY_STOP_MIN_DELTA", "0.0"))
 
     def _load_player_config(self):
         self.player_gamma = float(os.getenv("PLAYER_GAMMA", 0.99))

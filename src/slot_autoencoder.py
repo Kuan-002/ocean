@@ -115,7 +115,8 @@ class SlotAutoencoder(nn.Module):
         torch.save(save_dict, path)
 
     def load(self, path: str):
-        checkpoint = torch.load(path, weights_only=True)
+        device = next(self.parameters()).device
+        checkpoint = torch.load(path, map_location=device, weights_only=True)
         self.load_state_dict(checkpoint["model_state_dict"])
         self.optimiser.load_state_dict(checkpoint["optimizer_state_dict"])
         return checkpoint["best_loss"]

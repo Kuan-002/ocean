@@ -1,3 +1,6 @@
+import json
+import os
+
 import torch
 from tqdm import tqdm
 from src.slot_autoencoder import SlotAutoencoder
@@ -24,17 +27,22 @@ class Trainer:
         self.loss_threshold = config.loss_threshold
         self.tqdm_interval = config.tqdm_interval
         self.debug = config.debug
+        self.max_train_batches = config.max_train_batches
         self.save_freq = config.save_freq
         self.reinforce_loss_weight = config.reinforce_loss_weight
         self.ce_loss_weight = config.ce_loss_weight
         self.sa_loss_weight = config.sa_loss_weight
         self.em_reward_sa_loss_scaling = config.em_reward_sa_loss_scaling
         self.min_save_epochs = config.min_save_epochs
+        self.sa_early_stop_patience = config.sa_early_stop_patience
+        self.sa_early_stop_min_delta = config.sa_early_stop_min_delta
 
         if sa_best_loss != None:
             self.sa_best_loss = sa_best_loss
         else:
             self.sa_best_loss = self.loss_threshold
+        self.sa_early_stop_best = self._to_float(self.sa_best_loss)
+        self.sa_early_stop_bad_checks = 0
 
         if cg_best_loss != None:
             self.cg_best_loss = cg_best_loss
@@ -42,6 +50,7 @@ class Trainer:
             self.cg_best_loss = self.loss_threshold
 
         self.best_accuracy = 0
+        self.sa_history = []
 
     def train_e2e_em(self, dataloader: DataLoader, evaluator: Evaluator):
         print("Sanity Check")
@@ -86,7 +95,10 @@ class Trainer:
 
             if (epoch + 1) % self.checkpoint == 0:
                 valid_loss = evaluator.evaluate_sa(train_loss)
+                self.record_sa_history(epoch, train_loss, valid_loss)
                 self.save_checkpoint_sa(epoch, valid_loss)
+                if self.should_stop_sa_early(epoch, valid_loss):
+                    break
 
     def train_consensus_game(self, dataloader: DataLoader, extract_slots: callable, evaluator: Evaluator):
         print("Sanity Check")
@@ -240,7 +252,9 @@ class Trainer:
         )
         total_loss, count = 0, 0
 
-        for _, (x, _, _) in loader:
+        for batch_idx, (x, _, _) in loader:
+            if self.max_train_batches > 0 and batch_idx >= self.max_train_batches:
+                break
             x = x.to(self.device)
             self.sa.zero_grad(set_to_none=True)
             recon_combined, _, _, _, _ = self.sa(x)
@@ -348,9 +362,59 @@ class Trainer:
         
         if not save:
             return
-        
-        self.sa.save(f"{self.checkpoint_path_sa}{epoch}_ckpt.pt", reference_loss)
+
+        epoch_path = f"{self.checkpoint_path_sa}{epoch}_ckpt.pt"
+        best_path = os.path.join(self.checkpoint_path_sa, "best_ckpt.pt")
+        self.sa.save(epoch_path, reference_loss)
+        self.sa.save(best_path, reference_loss)
         print(f"SA Model saved at epoch {epoch + 1} with loss {reference_loss:.8f}")
+
+    def record_sa_history(self, epoch: int, train_loss: torch.Tensor, valid_loss: torch.Tensor):
+        if self.checkpoint_path_sa is None:
+            return
+
+        train_value = train_loss.item() if hasattr(train_loss, "item") else float(train_loss)
+        valid_value = valid_loss.item() if hasattr(valid_loss, "item") else float(valid_loss)
+        self.sa_history.append(
+            {
+                "epoch": epoch + 1,
+                "train_loss": train_value,
+                "valid_loss": valid_value,
+                "best_valid_loss": min(valid_value, float(self.sa_best_loss)),
+            }
+        )
+        history_path = os.path.join(os.path.dirname(self.checkpoint_path_sa.rstrip("/")), "sa_history.json")
+        with open(history_path, "w") as f:
+            json.dump(self.sa_history, f, indent=2)
+
+    def should_stop_sa_early(self, epoch: int, valid_loss: torch.Tensor):
+        if self.sa_early_stop_patience <= 0:
+            return False
+
+        valid_value = self._to_float(valid_loss)
+        if valid_value < self.sa_early_stop_best - self.sa_early_stop_min_delta:
+            self.sa_early_stop_best = valid_value
+            self.sa_early_stop_bad_checks = 0
+            return False
+
+        self.sa_early_stop_bad_checks += 1
+        print(
+            "SA early stop check {}/{} at epoch {}: valid_loss={:.8f}, best={:.8f}".format(
+                self.sa_early_stop_bad_checks,
+                self.sa_early_stop_patience,
+                epoch + 1,
+                valid_value,
+                self.sa_early_stop_best,
+            )
+        )
+        if self.sa_early_stop_bad_checks >= self.sa_early_stop_patience:
+            print(f"Stopping SA training early at epoch {epoch + 1}.")
+            return True
+        return False
+
+    @staticmethod
+    def _to_float(value):
+        return value.item() if hasattr(value, "item") else float(value)
 
     def save_checkpoints(self, epoch: int, sa_loss: float, accuracy: float):
         if accuracy > self.best_accuracy:
