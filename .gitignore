@@ -10,20 +10,70 @@ dist/
 build/
 bin/
 out/
+best/
 examples/
 logs/
 scripts/datasets/
 scripts/envs/
 .claude/
+
+# Generated reports, paper figures, and architecture exports
+/paper_figure_*
+/docs/*.html
+/docs/*.pdf
+/docs/*.png
+/docs/*.svg
+/docs/architecture_assets/
+/docs/test_accuracy_comparison_for_paper.txt
+
+# Local experiment and cluster launch scripts
+*.sh
+
+# External-only datasets, checkpoints, environments, and run artifacts
+/data/
+/dataset/
+/datasets/
+/checkpoints/
+/runs/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.tfrecord
+*.tfrecords
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.h5
+*.hdf5
+.env
+.env.*
+
+# Minimal test-only repository allowlist. The retained entry point is
+# scripts/eval_selector_v1_test.py, as used by Experiments/ocean_* jobs.
+/*
+!/.gitignore
+!/README.md
+!/requirements.txt
+!/scripts/
+!/src/
+
+/scripts/*
+!/scripts/eval_selector_v1_test.py
+!/scripts/run_test.sh
+
+/src/*
+!/src/config.py
+!/src/clevr_hans_dataset.py
+!/src/selector_v1_ac.py
+!/src/slot_attention.py
+!/src/slot_autoencoder.py
+
 # Tests / coverage
 .pytest_cache/
 .coverage
 htmlcov/
-
-# Local env (root); template envs under scripts/envs/ stay tracked
-#/.env
-
-# Checkpoints, runs, datasets (large)
 
 slurm.sh
 # Logs / OS
