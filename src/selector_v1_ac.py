@@ -27,12 +27,16 @@ class ACConfig:
     r_wrong: float = 1.0
     lambda_over: float = 0.10
     lambda_under: float = 0.30
+    premature_stop_coef: float = 0.0
+    future_gain_margin: float = 0.0
     value_coef: float = 0.5
     class_coef: float = 0.3
     full_order_class_coef: float = 0.1
     entropy_coef: float = 0.01
     dropout: float = 0.1
     global_init: bool = False
+    first_step_cross_attention: bool = False
+    first_step_num_heads: int = 4
     early_exit_conf: float = 0.8
     ordered_classifier: bool = False
     cross_attention_classifier: bool = False
@@ -74,6 +78,11 @@ class SlotSelectorAC(nn.Module):
             )
         if cfg.ordered_classifier and cfg.cross_attention_classifier:
             raise ValueError("ordered_classifier and cross_attention_classifier are mutually exclusive")
+        if cfg.first_step_cross_attention and cfg.embed_dim % cfg.first_step_num_heads != 0:
+            raise ValueError(
+                "embed_dim must be divisible by first_step_num_heads when "
+                "first_step_cross_attention is enabled"
+            )
         self.cfg = cfg
         d = cfg.embed_dim
         input_dim = cfg.slot_dim + cfg.pos_dim
@@ -85,6 +94,19 @@ class SlotSelectorAC(nn.Module):
             nn.LayerNorm(d),
         )
         self.global_init = nn.Linear(d, d) if cfg.global_init else None
+        if cfg.first_step_cross_attention:
+            self.first_step_query = nn.Parameter(torch.zeros(1, 1, d))
+            self.first_step_attention = nn.MultiheadAttention(
+                d,
+                cfg.first_step_num_heads,
+                dropout=cfg.dropout,
+                batch_first=True,
+            )
+            self.first_step_norm = nn.LayerNorm(d)
+        else:
+            self.first_step_query = None
+            self.first_step_attention = None
+            self.first_step_norm = None
         self.action_query_proj = nn.Linear(d, d)
         self.stop_head = nn.Linear(d, 1)
         self.gru = nn.GRUCell(d, d)
@@ -146,6 +168,21 @@ class SlotSelectorAC(nn.Module):
         evidence = slot_embeds.new_zeros(b, d)
         return h, evidence
 
+    def action_state(
+        self,
+        h: torch.Tensor,
+        slot_embeds: torch.Tensor,
+        *,
+        step: int,
+    ) -> torch.Tensor:
+        if step != 0 or self.first_step_attention is None:
+            return h
+        if self.first_step_query is None or self.first_step_norm is None:
+            raise RuntimeError("first-step cross-attention layers are not initialized")
+        query = self.first_step_query.expand(slot_embeds.size(0), -1, -1)
+        context, _ = self.first_step_attention(query, slot_embeds, slot_embeds, need_weights=False)
+        return self.first_step_norm(context.squeeze(1))
+
     def min_steps_for_classes(self, class_ids: torch.Tensor) -> torch.Tensor:
         if self.cfg.class_min_slots is None:
             return torch.full_like(class_ids, self.cfg.min_steps)
@@ -197,7 +234,8 @@ class SlotSelectorAC(nn.Module):
         valid_slot_mask: Optional[torch.Tensor] = None,
         min_steps: Optional[int | torch.Tensor] = None,
     ) -> torch.Tensor:
-        query = self.action_query_proj(h)
+        action_h = self.action_state(h, slot_embeds, step=step)
+        query = self.action_query_proj(action_h)
         slot_logits = torch.einsum("bd,bkd->bk", query, slot_embeds) / math.sqrt(self.cfg.embed_dim)
         slot_logits = slot_logits.masked_fill(selected_mask, torch.finfo(slot_logits.dtype).min)
         if valid_slot_mask is not None:
@@ -376,6 +414,111 @@ def compute_returns(rewards: list[torch.Tensor], gamma: float) -> list[torch.Ten
     return returns
 
 
+def best_future_logp_gain(
+    model: SlotSelectorAC,
+    h: torch.Tensor,
+    evidence: torch.Tensor,
+    selected_mask: torch.Tensor,
+    slot_embeds: torch.Tensor,
+    labels: torch.Tensor,
+    current_log_p_true: torch.Tensor,
+    active: torch.Tensor,
+) -> torch.Tensor:
+    gains = []
+    b, k, _ = slot_embeds.shape
+    rows = torch.arange(b, device=slot_embeds.device)
+    for idx in range(k):
+        candidate_active = active & ~selected_mask[:, idx]
+        action = torch.full((b,), idx, dtype=torch.long, device=slot_embeds.device)
+        cand_h, cand_evidence, cand_selected = model.update_with_action(
+            h.detach(),
+            evidence.detach(),
+            selected_mask.detach(),
+            slot_embeds.detach(),
+            action,
+            candidate_active,
+        )
+        cand_logits = model.classify(
+            cand_h,
+            cand_evidence,
+            model.selected_pool(slot_embeds.detach(), cand_selected),
+            slot_embeds.detach(),
+            cand_selected,
+        )
+        cand_log_p_true = F.log_softmax(cand_logits, dim=-1)[rows, labels]
+        gain = cand_log_p_true - current_log_p_true
+        gain = torch.where(candidate_active, gain, current_log_p_true.new_full((b,), float("-inf")))
+        gains.append(gain)
+    best = torch.stack(gains, dim=1).max(dim=1).values
+    return torch.where(torch.isfinite(best), best, torch.zeros_like(best))
+
+
+def binary_auc(scores: torch.Tensor, labels: torch.Tensor) -> float | None:
+    labels = labels.float()
+    pos = labels.sum()
+    neg = labels.numel() - pos
+    if pos <= 0 or neg <= 0:
+        return None
+    sorted_scores, order = scores.sort()
+    sorted_ranks = torch.arange(1, scores.numel() + 1, dtype=torch.float64)
+    _unique_scores, counts = torch.unique_consecutive(sorted_scores, return_counts=True)
+    rank_sums = torch.split(sorted_ranks, counts.tolist())
+    average_ranks = torch.cat(
+        [
+            ranks.new_full((count,), float(ranks.mean()))
+            for ranks, count in zip(rank_sums, counts.tolist())
+        ]
+    )
+    ranks = torch.empty_like(scores, dtype=torch.float64)
+    ranks[order] = average_ranks
+    pos_rank_sum = ranks[labels.bool()].sum()
+    auc = (pos_rank_sum - pos.double() * (pos.double() + 1.0) / 2.0) / (
+        pos.double() * neg.double()
+    )
+    return float(auc)
+
+
+def multiclass_metrics(logits: torch.Tensor, labels: torch.Tensor, num_classes: int) -> dict[str, float]:
+    probs = logits.softmax(dim=-1).cpu()
+    labels = labels.cpu()
+    pred = probs.argmax(dim=-1)
+    tp = torch.zeros(num_classes, dtype=torch.float64)
+    fp = torch.zeros(num_classes, dtype=torch.float64)
+    fn = torch.zeros(num_classes, dtype=torch.float64)
+    tn = torch.zeros(num_classes, dtype=torch.float64)
+    for cls in range(num_classes):
+        pred_cls = pred == cls
+        true_cls = labels == cls
+        tp[cls] = (pred_cls & true_cls).sum()
+        fp[cls] = (pred_cls & ~true_cls).sum()
+        fn[cls] = (~pred_cls & true_cls).sum()
+        tn[cls] = (~pred_cls & ~true_cls).sum()
+    precision_per_class = tp / (tp + fp).clamp_min(1e-8)
+    recall_per_class = tp / (tp + fn).clamp_min(1e-8)
+    specificity_per_class = tn / (tn + fp).clamp_min(1e-8)
+    f1_per_class = 2.0 * tp / (2.0 * tp + fp + fn).clamp_min(1e-8)
+    balanced_accuracy_per_class = 0.5 * (recall_per_class + specificity_per_class)
+    one_hot = F.one_hot(labels, num_classes=num_classes).float()
+    aucs = [binary_auc(probs[:, cls], one_hot[:, cls]) for cls in range(num_classes)]
+    valid_aucs = [auc for auc in aucs if auc is not None]
+    micro_auc = binary_auc(probs.flatten(), one_hot.flatten())
+    accuracy = pred.eq(labels).float().mean().item()
+    macro_auc = sum(valid_aucs) / len(valid_aucs) if valid_aucs else 0.0
+    return {
+        "accuracy": float(accuracy),
+        "acc": float(accuracy),
+        "balanced_accuracy": float(balanced_accuracy_per_class.mean()),
+        "macro_balanced_accuracy": float(balanced_accuracy_per_class.mean()),
+        "macro_specificity": float(specificity_per_class.mean()),
+        "precision": float(precision_per_class.mean()),
+        "recall": float(recall_per_class.mean()),
+        "f1": float(f1_per_class.mean()),
+        "auc": macro_auc,
+        "macro_auc": macro_auc,
+        "micro_auc": micro_auc if micro_auc is not None else 0.0,
+    }
+
+
 def rollout_actor_critic(
     model: SlotSelectorAC,
     slots: torch.Tensor,
@@ -458,6 +601,20 @@ def rollout_actor_critic(
             slots.new_full((b,), cfg.r_correct),
             slots.new_full((b,), -cfg.r_wrong),
         )
+        if cfg.premature_stop_coef > 0:
+            future_gain = best_future_logp_gain(
+                model,
+                h,
+                evidence,
+                selected_mask,
+                slot_embeds,
+                labels,
+                log_p_true.detach(),
+                active,
+            )
+            stop_reward = stop_reward - cfg.premature_stop_coef * torch.relu(
+                future_gain - cfg.future_gain_margin
+            )
         stop_reward = stop_reward - cfg.lambda_over * too_many - cfg.lambda_under * too_few
         terminal_by_horizon = active & ~is_stop & (step == min(cfg.max_steps, k) - 1)
         reward = torch.where(is_stop | terminal_by_horizon, stop_reward, select_reward)
@@ -557,6 +714,8 @@ def evaluate_greedy(
     per_class_correct = torch.zeros(num_classes, dtype=torch.float64)
     per_class_total = torch.zeros(num_classes, dtype=torch.float64)
     per_class_selected = torch.zeros(num_classes, dtype=torch.float64)
+    logits_all = []
+    labels_all = []
 
     for batch_idx, (images, _, labels) in enumerate(loader):
         if max_batches and batch_idx >= max_batches:
@@ -571,6 +730,8 @@ def evaluate_greedy(
         logits = out.logits
         loss_sum += F.cross_entropy(logits, labels, reduction="sum").item()
         pred = logits.argmax(dim=-1)
+        logits_all.append(logits.detach().cpu())
+        labels_all.append(labels.detach().cpu())
         counts = out.selected_counts.detach().cpu()
         total += labels.size(0)
         correct += (pred == labels).sum().item()
@@ -594,11 +755,14 @@ def evaluate_greedy(
 
     metrics: dict[str, float] = {
         "loss": loss_sum / max(total, 1),
-        "accuracy": correct / max(total, 1),
         "avg_selected": selected_sum / max(total, 1),
         "median_selected": median_selected,
         "total": float(total),
     }
+    if logits_all:
+        metrics.update(multiclass_metrics(torch.cat(logits_all, dim=0), torch.cat(labels_all, dim=0), num_classes))
+    else:
+        metrics.update({"accuracy": 0.0, "acc": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0, "auc": 0.0, "macro_auc": 0.0, "micro_auc": 0.0})
     for count in range(model.cfg.num_slots + 1):
         metrics[f"selected_count_{count}"] = count_hist[count].item() / max(total, 1)
     for cls in range(num_classes):

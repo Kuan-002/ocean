@@ -61,7 +61,9 @@ scripts/envs/
 
 /scripts/*
 !/scripts/eval_selector_v1_test.py
-!/scripts/run_test.sh
+!/scripts/train_slot_attention.py
+!/scripts/train_selector_v1_ac.py
+!/scripts/train_selector_v1_grpo.py
 
 /src/*
 !/src/config.py
@@ -69,6 +71,7 @@ scripts/envs/
 !/src/selector_v1_ac.py
 !/src/slot_attention.py
 !/src/slot_autoencoder.py
+!/src/runtime.py
 
 # Tests / coverage
 .pytest_cache/
